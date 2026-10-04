@@ -1,0 +1,7 @@
+#!/bin/bash
+# 安装前：准备数据目录
+set -u
+VAR_DIR="${TRIM_PKGVAR:-/var/apps/gpuconsole/var}"
+mkdir -p "$VAR_DIR" 2>/dev/null
+echo "[$(date '+%F %T')] install_init: 目录已准备 $VAR_DIR" >> "$VAR_DIR/cmd.log" 2>/dev/null
+exit 0

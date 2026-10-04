@@ -1,0 +1,12 @@
+#!/bin/bash
+# 升级前：停止旧版本网关（避免抢 socket）
+set -u
+APP_DEST="${TRIM_APPDEST:-/var/apps/gpuconsole/target}"
+VAR_DIR="${TRIM_PKGVAR:-/var/apps/gpuconsole/var}"
+# 解释器探测（fnOS 应用环境 PATH 可能不全，必须绝对路径兜底）
+PY=$(command -v python3 2>/dev/null)
+[ -z "$PY" ] && PY=$(command -v python 2>/dev/null)
+[ -z "$PY" ] && [ -x /usr/bin/python3 ] && PY=/usr/bin/python3
+[ -z "$PY" ] && PY=python3
+"$PY" "$APP_DEST/server/gateway.py" stop 2>&1 | tee -a "$VAR_DIR/cmd.log"
+exit 0

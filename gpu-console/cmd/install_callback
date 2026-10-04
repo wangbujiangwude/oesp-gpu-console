@@ -1,0 +1,52 @@
+#!/bin/bash
+# 安装后：① 写入受限 sudo 授权（让控制台能真正一键修补） ② 启动网关
+#
+# 为什么要 sudo 授权：
+#   控制台以应用用户（gpuconsole）运行，没有 root。而"一键修补"里最有效的几项
+#   （modprobe meson-vdec、chmod 宿主 /dev/video0、写 udev 规则、改安卓容器编排
+#   并重建）都必须是 root。没有授权时，控制台只能做容器层（docker 组内可做的部分），
+#   其余降级为"给你一条命令去 SSH 里跑"。
+#
+# 安全边界：
+#   · 只放行【本应用自带的这一个修补脚本】，不放行 shell / 任意命令
+#   · 脚本自身不接受外部路径参数，内部操作固定，且不碰雷区设备
+#   · 用 visudo -cf 先校验语法，校验不过就撤掉，绝不留下坏 sudoers 拖垮整个 sudo
+set -u
+APP_DEST="${TRIM_APPDEST:-/var/apps/gpuconsole/target}"
+VAR_DIR="${TRIM_PKGVAR:-/var/apps/gpuconsole/var}"
+mkdir -p "$VAR_DIR" 2>/dev/null
+log(){ echo "[$(date '+%F %T')] install_callback: $*" >> "$VAR_DIR/cmd.log" 2>/dev/null; }
+
+# ---- sudo 授权 ----
+# 应用运行用户：以应用目录属主为准（比硬编码 gpuconsole 可靠）
+APP_USER=$(stat -c %U "$APP_DEST" 2>/dev/null)
+[ -z "$APP_USER" ] || [ "$APP_USER" = "UNKNOWN" ] && APP_USER="gpuconsole"
+FIX_SH="$APP_DEST/scripts/oesp_gpu_fix.sh"
+
+if [ "$(id -u)" = "0" ] && [ -f "$FIX_SH" ]; then
+    SF=/etc/sudoers.d/gpuconsole-fix     # 文件名不能含 "." ，否则 sudoers.d 会忽略
+    TMP="$SF.tmp.$$"
+    cat > "$TMP" <<EOF
+# fnOS 应用 gpuconsole：仅允许免密执行本应用自带的一键修补脚本
+# （安装钩子自动生成；卸载时由 uninstall_callback 删除）
+$APP_USER ALL=(root) NOPASSWD: $FIX_SH
+EOF
+    if command -v visudo >/dev/null 2>&1 && visudo -cf "$TMP" >/dev/null 2>&1; then
+        mv "$TMP" "$SF" && chmod 440 "$SF" && chown root:root "$SF" 2>/dev/null
+        log "已写入 sudo 授权 $SF → $APP_USER 可免密执行修补脚本"
+    else
+        rm -f "$TMP"
+        log "visudo 校验未通过或不可用，跳过 sudo 授权（一键修补将降级为命令行模式）"
+    fi
+else
+    log "非 root 或修补脚本缺失，跳过 sudo 授权"
+fi
+
+# ---- 启动网关 ----
+# 解释器探测（fnOS 应用环境 PATH 可能不全，必须绝对路径兜底）
+PY=$(command -v python3 2>/dev/null)
+[ -z "$PY" ] && PY=$(command -v python 2>/dev/null)
+[ -z "$PY" ] && [ -x /usr/bin/python3 ] && PY=/usr/bin/python3
+[ -z "$PY" ] && PY=python3
+"$PY" "$APP_DEST/server/gateway.py" start 2>&1 | tee -a "$VAR_DIR/cmd.log"
+exit 0

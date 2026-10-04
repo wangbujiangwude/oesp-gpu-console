@@ -1,0 +1,36 @@
+# ==============================================================================
+#  行尾策略 —— 项目踩过 CRLF 的坑，必须锁死
+#
+#  事故：Windows 上编辑过的 .sh 带 CRLF，shebang 行变成 "#!/bin/bash\r"，
+#       内核按 "/bin/bash\r" 找解释器 → 报 "No such file or directory"。
+#       用 `bash xxx.sh` 显式调用时不暴露，所以极难定位。
+#
+#  这里强制：所有脚本与文本一律以 LF 入库、以 LF 检出（不受各人 core.autocrlf 影响）。
+#  二进制（fpk / so / 图标）禁止做任何换行转换。
+# ==============================================================================
+
+# ---- 文本：统一 LF ----
+*.sh        text eol=lf
+*.py        text eol=lf
+*.md        text eol=lf
+*.xml       text eol=lf
+*.c         text eol=lf
+*.h         text eol=lf
+LICENSE     text eol=lf
+NOTICE      text eol=lf
+manifest    text eol=lf
+.gitattributes text eol=lf
+.gitignore  text eol=lf
+
+# ---- fnOS FPK 生命周期钩子（无扩展名，但本质是 shell 脚本）----
+cmd/*       text eol=lf
+ui/config   text eol=lf
+config/*    text eol=lf
+wizard/*    text eol=lf
+
+# ---- 二进制：绝不转换 ----
+*.fpk       binary
+*.so        binary
+*.PNG       binary
+*.png       binary
+*.tgz       binary

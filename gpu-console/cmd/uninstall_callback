@@ -1,0 +1,11 @@
+#!/bin/bash
+# 卸载后：撤掉 sudo 授权 + 清理残留 socket / pid
+set -u
+APP_DEST="${TRIM_APPDEST:-/var/apps/gpuconsole/target}"
+VAR_DIR="${TRIM_PKGVAR:-/var/apps/gpuconsole/var}"
+
+rm -f /etc/sudoers.d/gpuconsole-fix /etc/sudoers.d/gpuconsole-fix.tmp.* 2>/dev/null
+
+rm -f "$APP_DEST/app.sock" "$VAR_DIR/gateway.pid" "$VAR_DIR/gateway.child.pid" 2>/dev/null
+echo "[$(date '+%F %T')] uninstall_callback: 已清理（含 sudo 授权）" >> "$VAR_DIR/cmd.log" 2>/dev/null
+exit 0

@@ -1,0 +1,15 @@
+[
+  {
+    "stepTitle": "GPU 控制台说明",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "本应用用于<b>实时查看设备 GPU 与视频硬解器的运行状态</b>，安装后无需任何配置，直接打开即可使用。<br><br><b>能看什么：</b>3D GPU 负载（panfrost job 中断速率）、视频硬解负载（VDEC 中断速率）、GPU 频率、CMA 连续内存、温度、驱动模块状态、容器 GPU 占用情况，以及最近 10 分钟的趋势曲线。<br><br><b>安全说明：</b>本应用<b>只读</b>，不会修改任何系统配置。所有数据均来自 <code>/proc</code> 与 <code>/sys/class/devfreq</code>、<code>/sys/class/thermal</code> 等安全路径。<br><br><b>重要：</b>本应用已刻意规避两个会导致整机死锁的路径 —— <code>/sys/class/vdec/*</code> 与 <code>/dev/video26</code>。请勿在别处访问它们。"
+      },
+      {
+        "type": "tips",
+        "helpText": "<b>数据说明：</b>部分设备（如 Amlogic S922X）无法读取 GPU 利用率百分比（驱动未暴露 utilization 节点），因此本应用使用<b>中断速率</b>作为负载代理指标，这是该平台上唯一可行且安全的方法。<br><br>如果你的设备是 x86 或非 Amlogic 平台，3D GPU 与 VDEC 相关指标会显示为「未就绪」，其余指标（温度、内存、容器）仍正常显示。"
+      }
+    ]
+  }
+]

@@ -1,0 +1,54 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 laowang
+#
+# 本项目原创部分以 MIT 许可发布，详见仓库根目录 LICENSE 文件。
+# 第三方代码保留其原始许可，详见 NOTICE 文件。
+
+# fnOS 应用生命周期入口：cmd/main <action>
+# fnOS 会注入环境变量：TRIM_APPDEST（应用目录）TRIM_PKGVAR（数据目录）
+set -u
+APP_DEST="${TRIM_APPDEST:-/var/apps/gpuconsole/target}"
+VAR_DIR="${TRIM_PKGVAR:-/var/apps/gpuconsole/var}"
+GW="$APP_DEST/server/gateway.py"
+LOG="$VAR_DIR/cmd.log"
+
+log(){ mkdir -p "$VAR_DIR" 2>/dev/null; echo "[$(date '+%F %T')] main $*" >> "$LOG" 2>/dev/null; }
+log "action=${1:-}"
+
+# 解释器探测（fnOS 应用环境 PATH 可能不全，必须绝对路径兜底）
+PY=$(command -v python3 2>/dev/null)
+[ -z "$PY" ] && PY=$(command -v python 2>/dev/null)
+[ -z "$PY" ] && [ -x /usr/bin/python3 ] && PY=/usr/bin/python3
+[ -z "$PY" ] && PY=python3
+
+case "${1:-status}" in
+  start)
+    "$PY" "$GW" start 2>&1 | tee -a "$LOG"
+    ;;
+  stop)
+    "$PY" "$GW" stop 2>&1 | tee -a "$LOG"
+    ;;
+  restart)
+    "$PY" "$GW" restart 2>&1 | tee -a "$LOG"
+    ;;
+  status|hastart)
+    # hastart 是 fnOS 开机时的"是否已启动"探测。实测它会因为残留的陈旧 app.sock
+    # 误判为已启动，从而【不再调用 start】，导致应用显示 running 但页面打不开。
+    # 所以这里让 hastart 也走 status —— status 自带自愈，探测即修复。
+    "$PY" "$GW" status 2>&1 | tee -a "$LOG"
+    ;;
+  install)
+    "$PY" "$GW" start 2>&1 | tee -a "$LOG"
+    ;;
+  uninstall)
+    "$PY" "$GW" stop 2>&1 | tee -a "$LOG"
+    ;;
+  upgrade)
+    "$PY" "$GW" restart 2>&1 | tee -a "$LOG"
+    ;;
+  *)
+    echo "用法: cmd/main {start|stop|restart|status|install|uninstall|upgrade}"
+    ;;
+esac
+exit 0
