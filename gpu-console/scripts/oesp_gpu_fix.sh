@@ -187,6 +187,30 @@ detect() {
         add H10 host warn "GPU 设备 udev 规则" "未配置，容器权限依赖手动 chmod" "写入 99-oesp-gpu.rules" 1
     fi
 
+    # ---- H11 厂商解码栈格式模块（amvdec_*）----
+    # 飞牛官方只加载框架 amvdec_ports，具体格式模块默认不加载，
+    # 导致 HEVC / AV1 / VP9 / AVS2 等硬件解码器空置。实测这些模块可安全加载。
+    # ⚠ 用 /proc/modules 而不是 lsmod（lsmod 在 /usr/sbin，应用用户 PATH 里没有）
+    if ! grep -q "^amvdec_ports " /proc/modules 2>/dev/null; then
+        add H11 host warn "厂商解码栈框架" "amvdec_ports 未加载，厂商全格式解码不可用" "modprobe amvdec_ports" 1
+    else
+        local fm_ok=0 fm_miss=""
+        for m in amvdec_mmpeg12 amvdec_h265 amvdec_av1 amvdec_vp9 amvdec_avs2 amvdec_vc1 amvdec_mmjpeg amvdec_mmpeg4; do
+            if grep -q "^${m} " /proc/modules 2>/dev/null; then
+                fm_ok=$((fm_ok + 1))
+            else
+                fm_miss="$fm_miss $m"
+            fi
+        done
+        if [ "$fm_ok" -eq 8 ]; then
+            add H11 host ok "厂商解码格式模块" "8/8 已加载（HEVC/AV1/VP9/AVS2/VC1/MJPEG/MPEG4/MPEG12）"
+        elif [ "$fm_ok" -gt 0 ]; then
+            add H11 host warn "厂商解码格式模块" "$fm_ok/8 已加载，缺:$fm_miss" "bash /usr/local/lib/oesp-gpu/amvdec_formats.sh" 1
+        else
+            add H11 host fail "厂商解码格式模块" "0/8，厂商解码器全部空置（社区栈只支持 H.264）" "bash /usr/local/lib/oesp-gpu/amvdec_formats.sh" 1
+        fi
+    fi
+
     # ---------- 容器 ----------
     if [ "$CTR_UP" != "1" ]; then
         add C1 container warn "安卓容器" "$CTR 未运行（后续容器项无法检测）" "启动安卓容器" 0
@@ -561,6 +585,20 @@ EOF
         else
             ok "OMX 自愈定时任务已存在"
         fi
+    fi
+
+    # 6.5 厂商解码格式模块（amvdec_*）：飞牛默认不加载，HEVC/AV1/VP9 等硬件空置
+    #     脚本自带「防启动循环」保护：加载前写标记、成功后清除，
+    #     若加载触发死锁被看门狗复位，重启后会检测到残留标记并跳过。
+    if [ -s "$SELF_DIR/amvdec_formats.sh" ]; then
+        cp -f "$SELF_DIR/amvdec_formats.sh" "$sdir/amvdec_formats.sh" 2>/dev/null \
+            && chmod 755 "$sdir/amvdec_formats.sh"
+        crontab -l 2>/dev/null | grep -q amvdec_formats || \
+            ( crontab -l 2>/dev/null; \
+              echo "* * * * * /bin/bash $sdir/amvdec_formats.sh >> /var/log/amvdec_formats.log 2>&1" ) | crontab -
+        ok "已固化厂商格式模块加载脚本（含防启动循环保护）"
+    else
+        warn "未找到 amvdec_formats.sh（应有于 $SELF_DIR/），HEVC/AV1 等格式模块不会自动加载"
     fi
 }
 

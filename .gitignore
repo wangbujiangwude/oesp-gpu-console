@@ -73,4 +73,6 @@ switch_ssh.py
 p*_probe.sh
 *_probe.sh
 w*_*.sh
+a*_audit.sh
+v[0-9]_*.sh
 *.bundle

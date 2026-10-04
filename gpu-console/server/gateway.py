@@ -36,7 +36,7 @@ try:
 except Exception:
     fcntl = None
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 APP_NAME = "gpuconsole"
 
 APP_DEST = os.environ.get("TRIM_APPDEST", "/var/apps/gpuconsole/target")
