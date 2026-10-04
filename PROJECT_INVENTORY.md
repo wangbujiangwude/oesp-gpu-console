@@ -283,9 +283,10 @@ bash omx-meson/build_mctest.sh    # 编译 mctest
 
 ```
 LICENSE  NOTICE  README.md  CONTRIBUTING.md  PROJECT_INVENTORY.md  .gitignore
+oesp_watchdog.py     （SoC 硬件看门狗守护，独立于 GPU 控制台，任何 Amlogic 机型可用）
 gpu-console/         （含随包分发的 libstagefrighthw32.so；app.tgz 已排除）
 release/gpuconsole_1.1.0.fpk
-docs/                （17 篇，已脱敏）
+docs/                （18 篇，已脱敏）
 ```
 
 > ⛔ **不含** OMX 插件源码（其预编译产物随 FPK 分发）、GPL 参考代码 —— 仓库为纯 MIT。

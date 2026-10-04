@@ -72,3 +72,5 @@ run_many.py
 switch_ssh.py
 p*_probe.sh
 *_probe.sh
+w*_*.sh
+*.bundle
