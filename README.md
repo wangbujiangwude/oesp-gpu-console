@@ -258,23 +258,43 @@ memcpy 优化零收益说明**搬运不是瓶颈**；等待直接卡死说明**�
 > 41~46%（720p：0.72s vs 1.22s）。但那不是真实播放器场景。
 > **请以真实播放器的对照为准。**
 
-**唯一能让硬解真正占优的路**是打通 Surface 零拷贝，而它卡在容器 gralloc 的 `-38`，
-目前**无解**。
+**让硬解真正占优有两条路**，此前只看到第一条：
 
-### 6.2 硬件能力天花板（不是配置问题）
+1. **Surface 零拷贝**（社区 `meson-vdec` 路线）—— 卡在容器 gralloc 的 `-38`，成本高；
+2. **换用厂商 `amvdec_ports` 栈**（2026-10-05 新增）—— 它自带 `bypass_vpp` /
+   `bypass_ge2d` / `enable_drm_mode` 参数，帧走 VDEC → VPP → ge2d → DRM dma-buf，
+   **CPU 全程不碰像素**，正是电视盒子的做法。障碍是 `/dev/video26` open 死锁（雷区 #1）。
 
-`meson-vdec` 的 `VIDIOC_ENUM_FMT` 实测结果：
+### 6.2 硬件能力天花板 —— ⚠️ 本节结论已于 2026-10-05 修正
 
-| 格式 | 状态 |
-|---|---|
-| H.264 | ✅ 已打通 |
-| VP9 / MPEG1 / MPEG2 | ⚠️ 硬件支持，但插件未接入 |
-| **HEVC / H.265** | ⛔ **硬件不存在**，只能软解 |
-| **AV1** | ⛔ **硬件不存在** |
+> **本节此前写的「HEVC / AV1 硬件不存在」是错的，特此更正。**
+> 那个结论来自社区驱动 `meson-vdec` 的 `VIDIOC_ENUM_FMT`，它只反映**社区驱动实现了什么**，
+> **不反映硬件有什么**。详见 `docs/厂商解码栈开盖报告_2026-10-05.md`。
 
-**实际影响**：相册/网盘里大量视频是 HEVC，这些**无论如何走不了硬解**。
-曾实测一段 HEVC（1024x576@30）在相册播放，宿主 `vdec` 中断增量为 **0**，
-全程 `OMX.google.hevc.decoder` 软解。这不是 bug，是硬件没有。
+`meson-vdec`（社区驱动）的 `VIDIOC_ENUM_FMT` 实测：
+
+| 格式 | 社区 `meson-vdec` | 硬件真实能力（厂商栈） |
+|---|---|---|
+| H.264 | ✅ 已打通 | ✅ `amvdec_mh264` |
+| VP9 / MPEG1 / MPEG2 | ⚠️ 硬件支持，插件未接入 | ✅ `amvdec_vp9` / `amvdec_mmpeg12` |
+| **HEVC / H.265** | ⛔ 社区驱动未实现 | ✅ **`amvdec_h265` 存在，未启用** |
+| **AV1** | ⛔ 社区驱动未实现 | ✅ **`amvdec_av1` 存在，未启用** |
+| AVS2 / AVS3 / VC1 / MPEG4 / MJPEG / H.266 | ⛔ 未实现 | ✅ 模块齐备，均未启用 |
+
+**更正后的事实**：飞牛系统内已内置 **61 个 Amlogic 厂商驱动模块**
+（`/lib/modules/$(uname -r)/updates/trim/amlogic-gx-vendor-drivers/`），
+`vermagic` 与当前内核**完全一致**，其中 45 个格式/加速模块**从未被加载**。
+微码 `/lib/firmware/video/video_ucode.bin`（1.6 MB）里内嵌了
+`g12a_hevc.bin`、`av1_mmu`、`g12a_avs2_mmu.bin`、`gxl_mpeg12_multi.bin` 等全部格式固件。
+
+**所以「HEVC 走不了硬解」不是硬件天花板，是「厂商栈没启用 + 我们一直在用社区驱动」**。
+此前实测 HEVC 播放 `vdec` 中断为 0，是因为走的是 `meson-vdec`（`vdec` 中断线），
+而厂商栈用的是另一套中断与内存路径。
+
+**为什么厂商栈没启用**：飞牛官方在 `/etc/modules-load.d/meson-vdec.conf` 里写明
+`# meson-vdec  # 禁用: 帧回传会挂死驱动`，并选择只启用 `galcore`。
+厂商栈的 V4L2 入口 `/dev/video26`（`aml-vcodec-dec`）**open 即整机死锁**，
+列入本项目五条致命雷区之首。这是当前唯一挡在厂商栈前面的障碍。
 
 另有两类 App 即使对 H.264 也用不上硬解：
 - **抖音**：使用自研 `libttffmpeg`，不走 `MediaCodec` → 劫持对它们无效
