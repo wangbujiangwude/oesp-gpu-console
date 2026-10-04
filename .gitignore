@@ -51,3 +51,12 @@ tools/
 Thumbs.db
 __pycache__/
 *.pyc
+
+# ------------------------------------------------------------------------------
+# 7) 本地发布辅助文件（不属于项目内容）
+#    _proxy_tunnel.py  —— 本机 HTTP 代理下的 SSH CONNECT 隧道（push 用）
+#    _release_notes.md —— 生成 Release 说明时的临时稿
+# ------------------------------------------------------------------------------
+_proxy_tunnel.py
+_release_notes.md
+_release_notes*.md

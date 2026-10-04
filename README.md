@@ -120,8 +120,11 @@ CPU 从满负荷的像素搬运中解脱。
 ### 4.1 GPU 控制台（推荐，风险最低）
 
 ```bash
-# 1) 打包（在仓库根目录）
-cd gpu-console && bash build_fpk.sh
+# 0) 获取源码（或直接下载 Release 里的 fpk，可跳过 1)
+git clone https://github.com/wangbujiangwude/oesp-gpu-console.git
+
+# 1) 打包（在 gpu-console 目录）
+cd oesp-gpu-console/gpu-console && bash build_fpk.sh
 # → ../gpuconsole_<版本>.fpk
 
 # 2) 在飞牛设备上安装
