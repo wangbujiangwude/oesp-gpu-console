@@ -36,7 +36,7 @@ try:
 except Exception:
     fcntl = None
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 APP_NAME = "gpuconsole"
 
 APP_DEST = os.environ.get("TRIM_APPDEST", "/var/apps/gpuconsole/target")
@@ -201,7 +201,9 @@ def devices():
 # 这比"中断增长率"强在能按进程归因 —— 直接回答"谁在占 GPU"。
 # ⛔ 全程只读 /proc，不碰 /sys/class/vdec 与 /dev/video26。
 _gpuc_cache = {"ts": 0.0, "data": []}
-GPUC_TTL = 3.0
+# v1.3.1：该面板在前端默认折叠，多数时候没人看，采集放慢到 6 秒一次
+# （走 sudo 通道时每次要 spawn 一个进程），展开后仍是秒级可见的近实时数据。
+GPUC_TTL = 6.0
 
 
 def _cgroup_of(pid):
@@ -323,7 +325,10 @@ def gpu_clients(force=False):
        `sudo -n ... --gpu-clients`（该脚本由 root 固化，sudoers 只放行它本身）。
     """
     now = time.time()
-    if not force and _gpuc_cache["data"] and (now - _gpuc_cache["ts"]) < GPUC_TTL:
+    # ⚠ 判据必须是【上次采集时间】而不是 "data 非空"：
+    # 没有任何 GPU 客户端时结果为空列表，若按 data 判断则缓存永不生效，
+    # 变成每 2 秒 spawn 一次 sudo 进程（白烧 CPU）。空结果也要缓存。
+    if not force and _gpuc_cache["ts"] and (now - _gpuc_cache["ts"]) < GPUC_TTL:
         return _gpuc_cache["data"]
 
     out = []
@@ -1077,6 +1082,19 @@ PAGE = r"""<!DOCTYPE html>
   .lv{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:6px;vertical-align:middle}
   .iss td{padding:6px 0;vertical-align:top}
   .iss td:last-child{text-align:right;white-space:nowrap}
+  /* 可折叠次要面板：默认收起，只占一行，不挤占主控制台版面 */
+  .fold{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin-bottom:12px}
+  .fold>summary{cursor:pointer;padding:10px 14px;font-size:12px;color:var(--dim);
+                letter-spacing:.5px;display:flex;align-items:center;gap:8px;
+                list-style:none;user-select:none}
+  .fold>summary::-webkit-details-marker{display:none}
+  .fold>summary:hover{color:var(--txt)}
+  .fold>summary::before{content:'\25B8';display:inline-block;transition:transform .18s;
+                        font-size:11px;color:var(--dim)}
+  .fold[open]>summary::before{transform:rotate(90deg)}
+  .fold>summary:focus{outline:none}
+  .foldbrief{margin-left:auto;font-size:11px;color:var(--blue);letter-spacing:0}
+  .foldbody{padding:10px 14px 12px;border-top:1px solid var(--line)}
 </style>
 </head>
 <body>
@@ -1142,11 +1160,13 @@ window.addEventListener('unhandledrejection', function(e){
   </div>
 </div>
 
-<div class="card" style="margin-bottom:16px">
-  <h2>② GPU 客户端（按进程归因）</h2>
-  <table id="gpuc"></table>
-  <div style="font-size:11px;color:var(--dim);margin-top:8px" id="gpucsub">读取中…</div>
-</div>
+<details class="fold" id="gpucFold">
+  <summary>GPU 客户端（按进程归因）<span class="foldbrief" id="gpucBrief">读取中…</span></summary>
+  <div class="foldbody">
+    <table id="gpuc"></table>
+    <div style="font-size:11px;color:var(--dim);margin-top:8px" id="gpucsub">读取中…</div>
+  </div>
+</details>
 
 <div class="card" style="margin-bottom:16px">
   <h2>硬件体检与一键修补</h2>
@@ -1200,7 +1220,7 @@ window.addEventListener('unhandledrejection', function(e){
 
 <div class="warnbox" style="display:block;margin-top:12px">⚠️ <b>致命雷区警告</b>：本机的 <b>/dev/video26</b> 与 <b>/sys/class/vdec</b> 一旦被任何程序访问（哪怕只是 cat 读取），会立即造成整机内核死锁，只能物理断电恢复。本控制台仅做只读采集，已全程规避这两个路径；也请务必不要用其它工具或脚本去触碰它们。</div>
 
-<div class="foot">GPU 控制台 v1.3.0 · 默认只读监控，仅在你点击修补/切换按钮时才改配置 · 开发者与发布者：老汪不讲武德</div>
+<div class="foot">GPU 控制台 v1.3.1 · 默认只读监控，仅在你点击修补/切换按钮时才改配置 · 开发者与发布者：老汪不讲武德</div>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -1323,6 +1343,7 @@ async function load(){
 }
 
 function render(d){
+  window.__last = d;                           // 折叠面板展开时可立即补渲染
   $('sub').textContent = '内核 ' + (d.devices.video0_name !== '-' ? 'VDEC 就绪' : 'VDEC 未就绪')
     + ' · 运行 ' + Math.floor(d.uptime_s/3600) + ' 小时 · 更新 ' + d.time;
 
@@ -1391,17 +1412,27 @@ function render(d){
 }
 
 // ---------- GPU 客户端（按进程归因） ----------
+// 该面板默认折叠：只占一行标题，不挤占主控制台版面；
+// 摘要（客户端数 / 常驻显存合计）始终随 2 秒轮询更新，表格仅在展开时渲染。
 function renderGpuClients(d){
   const gc = d.gpu_clients || [];
-  const el = $('gpuc');
-  if (!el) return;
+  const el = $('gpuc'), fold = $('gpucFold');
+  if (!el || !fold) return;
+  const total = gc.reduce((s, c) => s + c.res_mb, 0);
+  const brief = $('gpucBrief');
+  if (brief){
+    brief.textContent = gc.length
+      ? (gc.length + ' 个客户端 · 常驻 ' + total + ' MB')
+      : '无进程占用';
+    brief.style.color = gc.length ? 'var(--blue)' : 'var(--dim)';
+  }
+  if (!fold.open) return;                      // 折叠 → 只留摘要
   if (!gc.length){
     el.innerHTML = '<tr><td colspan="3" style="color:var(--dim)">当前没有进程持有 /dev/dri 节点'
       + '（或该驱动未提供 DRM fdinfo）</td></tr>';
     $('gpucsub').textContent = '本页数据来自 /proc/<pid>/fdinfo 的 drm-* 字段，只读采集';
     return;
   }
-  const total = gc.reduce((s, c) => s + c.res_mb, 0);
   el.innerHTML = gc.map(c => {
     const who = c.ctr
       ? '<span class="tag t-info">' + c.ctr + '</span>'
@@ -1589,6 +1620,18 @@ async function decSet(mode){
     el.textContent = '切换失败：' + e;
   }
 }
+
+/* 折叠面板：记住用户选择（localStorage）；展开瞬间用最后一份快照补渲染，
+   免得要等下一次 2 秒轮询才看到内容 */
+(function(){
+  const fold = $('gpucFold');
+  if (!fold) return;
+  try{ if (localStorage.getItem('oesp.gpucFold') === '1') fold.open = true; }catch(e){}
+  fold.addEventListener('toggle', function(){
+    try{ localStorage.setItem('oesp.gpucFold', fold.open ? '1' : '0'); }catch(e){}
+    if (fold.open && window.__last) renderGpuClients(window.__last);
+  });
+})();
 
 $('btnDetect').onclick = () => detect();
 $('btnFixC').onclick   = () => repair('container');
