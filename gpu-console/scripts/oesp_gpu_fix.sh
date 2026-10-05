@@ -746,10 +746,101 @@ for a in "$@"; do
         --host)   DO_HOST=1 ;;
         --rebuild) DO_REBUILD=1 ;;
         --decoder) MODE="--decoder" ;;
+        --gpu-clients) MODE="--gpu-clients" ;;
         soft|hard|status) DECODER_ARG="$a" ;;
         --yes)    ;;
     esac
 done
+
+# ---- GPU 客户端（按进程归因）----------------------------------------------
+# 内核 6.x 的 DRM fdinfo 会为每个 GPU client 报告驱动名、当前频率与显存占用，
+# 读法：/proc/<pid>/fd 里指向 /dev/dri/* 的 fd，再看 /proc/<pid>/fdinfo/<fd>。
+# 控制台应用以普通用户运行时读不到别的用户的 /proc/<pid>/fd（Permission denied），
+# 所以把这段采集放进已放行的 root 脚本，由应用经 sudo -n 调用。
+# ⛔ 全程只读 /proc，绝不碰 /sys/class/vdec 与 /dev/video26
+gpu_clients_json() {
+    python3 - <<'PYEOF'
+import os, json
+
+def rf(p):
+    try:
+        with open(p, "r") as f:
+            return f.read()
+    except Exception:
+        return ""
+
+def cgroup_of(pid):
+    for ln in rf("/proc/%s/cgroup" % pid).splitlines():
+        tail = ln.split("::")[-1] if "::" in ln else ln
+        for key in ("docker-", "libpod-", "crio-", "lxc/"):
+            i = tail.find(key)
+            if i >= 0:
+                return tail[i + len(key):].rstrip("/").replace(".scope", "")[:12]
+    return ""
+
+def num(info, key):
+    try:
+        return int(info.get(key, "0").split()[0])
+    except Exception:
+        return 0
+
+def mhz(info, key):
+    try:
+        return int(round(num(info, key) / 1000000.0))
+    except Exception:
+        return 0
+
+seen = {}
+try:
+    pids = [p for p in os.listdir("/proc") if p.isdigit()]
+except Exception:
+    pids = []
+
+for pid in pids:
+    fdd = "/proc/%s/fd" % pid
+    try:
+        fds = os.listdir(fdd)
+    except Exception:
+        continue
+    for fd in fds:
+        try:
+            link = os.readlink(os.path.join(fdd, fd))
+        except Exception:
+            continue
+        if "/dev/dri/" not in link:
+            continue
+        info = {}
+        for ln in rf("/proc/%s/fdinfo/%s" % (pid, fd)).splitlines():
+            if ln.startswith("drm-"):
+                k, _, v = ln.partition(":")
+                info[k.strip()] = v.strip()
+        if not info.get("drm-driver"):
+            continue
+        cid = info.get("drm-client-id", fd)
+        if (pid, cid) in seen:
+            continue
+        seen[(pid, cid)] = {
+            "pid": int(pid),
+            "comm": rf("/proc/%s/comm" % pid).strip() or "?",
+            "dev": link.rsplit("/", 1)[-1],
+            "driver": info.get("drm-driver", "?"),
+            "cid": cid,
+            "res_mb": num(info, "drm-resident-memory") // 1024,
+            "shared_mb": num(info, "drm-shared-memory") // 1024,
+            "total_mb": num(info, "drm-total-memory") // 1024,
+            "cur_mhz": mhz(info, "drm-curfreq-fragment") or mhz(info, "drm-curfreq-vertex-tiler"),
+            "max_mhz": mhz(info, "drm-maxfreq-fragment") or mhz(info, "drm-maxfreq-vertex-tiler"),
+            "cgroup": cgroup_of(pid),
+        }
+
+print(json.dumps(sorted(seen.values(), key=lambda x: -x["res_mb"])[:12], ensure_ascii=False))
+PYEOF
+}
+
+if [ "$MODE" = "--gpu-clients" ]; then
+    gpu_clients_json
+    exit 0
+fi
 
 if [ "$MODE" = "--decoder" ]; then
     if [ -z "$DECODER_ARG" ] || [ "$DECODER_ARG" = "status" ]; then

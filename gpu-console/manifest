@@ -1,7 +1,7 @@
 appname                    = gpuconsole
-version                   = 1.2.0
+version                   = 1.3.0
 display_name               = GPU 控制台
-desc                       = 实时查看飞牛 fnOS 设备上 GPU（Mali-G52 / panfrost）与视频硬解器（VDEC）的运行状态：3D 负载、硬解负载、GPU 频率、CMA 连续内存、温度、驱动模块、安卓容器 GPU 直通与硬解插件状态。新增【硬件体检与一键修补】：按硬件实际状态检测 20 项指标并打分，逐项列出问题与修法，可一键修补容器层（硬解插件注入/设备权限）与宿主层（模块加载/udev/自愈任务），并可一键把安卓容器从软件渲染切换为 GPU 硬件直通。已规避 /sys/class/vdec 与 /dev/video26 致命雷区。适用于 Amlogic G12 系列（S922X 等）设备，其它平台会自动降级。
+desc                       = 实时查看飞牛 fnOS 设备上 GPU（Mali-G52 / panfrost）与视频硬解器（VDEC）的运行状态：3D 负载、硬解负载、GPU 频率、CMA 连续内存、温度、驱动模块、安卓容器 GPU 直通与硬解插件状态。新增【GPU 客户端按进程归因】：读取内核 DRM fdinfo，直接列出每个占用 GPU 的进程及其常驻显存、共享显存与实时频率，回答「谁在用 GPU」。新增【硬件体检与一键修补】：按硬件实际状态检测 20 项指标并打分，逐项列出问题与修法，可一键修补容器层（硬解插件注入/设备权限）与宿主层（模块加载/udev/自愈任务），并可一键把安卓容器从软件渲染切换为 GPU 硬件直通。已规避 /sys/class/vdec 与 /dev/video26 致命雷区。适用于 Amlogic G12 系列（S922X 等）设备，其它平台会自动降级。
 platform                   = all
 source                     = thirdparty
 os_min_version             = 1.1.8
@@ -12,4 +12,4 @@ desktop_uidir              = ui
 desktop_applaunchname      = gpuconsole.Application
 checkport                  = false
 disable_authorization_path = true
-checksum                   = 0a4c1b6fcdc40a4ba870d2b51f48ddd6
+checksum                   = d009ccce51c0457b2aef185c6133d74e

@@ -36,7 +36,7 @@ try:
 except Exception:
     fcntl = None
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 APP_NAME = "gpuconsole"
 
 APP_DEST = os.environ.get("TRIM_APPDEST", "/var/apps/gpuconsole/target")
@@ -193,6 +193,167 @@ def devices():
         r[name] = os.path.exists(path)
     r["video0_name"] = read_file("/sys/class/video4linux/video0/name", "-") if r["vdec_video0"] else "-"
     return r
+
+
+# --------------------------------------------------------- GPU 客户端（按进程归因）
+# 内核 6.x 的 DRM fdinfo 会为每个 GPU client 报告驱动名、当前频率与显存占用，
+# 读法：ls -l /proc/<pid>/fd 找到指向 /dev/dri/* 的 fd，再 cat /proc/<pid>/fdinfo/<fd>。
+# 这比"中断增长率"强在能按进程归因 —— 直接回答"谁在占 GPU"。
+# ⛔ 全程只读 /proc，不碰 /sys/class/vdec 与 /dev/video26。
+_gpuc_cache = {"ts": 0.0, "data": []}
+GPUC_TTL = 3.0
+
+
+def _cgroup_of(pid):
+    """从 cgroup 里提取容器 id 片段（docker-<id12> 或 libpod-<id>），宿主进程返回 ''"""
+    try:
+        txt = read_file("/proc/%s/cgroup" % pid, "")
+    except Exception:
+        return ""
+    for ln in txt.splitlines():
+        tail = ln.split("::")[-1] if "::" in ln else ln
+        for key in ("docker-", "libpod-", "crio-", "lxc/"):
+            i = tail.find(key)
+            if i >= 0:
+                seg = tail[i + len(key):]
+                seg = seg.rstrip("/").replace(".scope", "")
+                return seg[:12]
+    return ""
+
+
+_docker_names = {"ts": 0.0, "map": {}}
+
+
+def docker_names():
+    """容器 id 前 12 位 -> 容器名。拿不到 docker 就返回空表（前端退回显示短 id）"""
+    now = time.time()
+    if _docker_names["map"] and (now - _docker_names["ts"]) < 60:
+        return _docker_names["map"]
+    m = {}
+    try:
+        out = sh("docker ps --format '{{.ID}}|{{.Names}}' 2>/dev/null", 6)
+        for ln in (out or "").splitlines():
+            if "|" in ln:
+                i, _, n = ln.partition("|")
+                if i.strip():
+                    m[i.strip()[:12]] = n.strip()
+    except Exception:
+        pass
+    _docker_names["ts"] = now
+    _docker_names["map"] = m
+    return m
+
+
+def _scan_local():
+    """本地直读 /proc。应用以普通用户运行时，别的用户的 /proc/<pid>/fd 会
+       Permission denied —— 那时列表为空，由 gpu_clients 退回 sudo 通道。"""
+
+    seen = {}          # (pid, client-id) -> 记录，避免同一 client 的多个 fd 重复计数
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except Exception:
+        pids = []
+
+    for pid in pids:
+        fdd = "/proc/%s/fd" % pid
+        try:
+            fds = os.listdir(fdd)
+        except Exception:
+            continue
+        for fd in fds:
+            try:
+                link = os.readlink(os.path.join(fdd, fd))
+            except Exception:
+                continue
+            if "/dev/dri/" not in link:
+                continue
+            info = {}
+            try:
+                for ln in read_file("/proc/%s/fdinfo/%s" % (pid, fd), "").splitlines():
+                    if ln.startswith("drm-"):
+                        k, _, v = ln.partition(":")
+                        info[k.strip()] = v.strip()
+            except Exception:
+                continue
+            if not info.get("drm-driver"):
+                continue          # 驱动没实现 fdinfo，跳过
+
+            def kb(key):
+                try:
+                    return int(info.get(key, "0").split()[0])
+                except (ValueError, IndexError):
+                    return 0
+
+            def mhz(key):
+                try:
+                    return int(round(int(info.get(key, "0").split()[0]) / 1000000.0))
+                except (ValueError, IndexError):
+                    return 0
+
+            cid = info.get("drm-client-id", fd)
+            k = (pid, cid)
+            if k in seen:
+                continue
+            try:
+                comm = read_file("/proc/%s/comm" % pid, "?").strip()
+            except Exception:
+                comm = "?"
+            cgrp = _cgroup_of(pid)
+            seen[k] = {
+                "ctr": docker_names().get(cgrp, ""),
+                "pid": int(pid),
+                "comm": comm,
+                "dev": link.rsplit("/", 1)[-1],
+                "driver": info.get("drm-driver", "?"),
+                "cid": cid,
+                "res_mb": kb("drm-resident-memory") // 1024,
+                "shared_mb": kb("drm-shared-memory") // 1024,
+                "total_mb": kb("drm-total-memory") // 1024,
+                "cur_mhz": mhz("drm-curfreq-fragment") or mhz("drm-curfreq-vertex-tiler"),
+                "max_mhz": mhz("drm-maxfreq-fragment") or mhz("drm-maxfreq-vertex-tiler"),
+                "cgroup": cgrp,
+            }
+
+    return sorted(seen.values(), key=lambda x: -x["res_mb"])[:12]
+
+
+def gpu_clients(force=False):
+    """GPU 客户端列表（按常驻显存降序）。
+       两级：① 本地直读 /proc（root 时可用）② 退回已放行的修补脚本
+       `sudo -n ... --gpu-clients`（该脚本由 root 固化，sudoers 只放行它本身）。
+    """
+    now = time.time()
+    if not force and _gpuc_cache["data"] and (now - _gpuc_cache["ts"]) < GPUC_TTL:
+        return _gpuc_cache["data"]
+
+    out = []
+    src = "local"
+    try:
+        out = _scan_local()
+    except Exception:
+        out = []
+
+    if not out:
+        fx = fix_script()
+        if os.path.isfile(fx):
+            try:
+                r = _run(["sudo", "-n", fx, "--gpu-clients"], 25)
+                txt = (r.stdout or b"").decode("utf-8", "replace").strip()
+                if txt.startswith("["):
+                    out = json.loads(txt)
+                    src = "sudo"
+                    for c in out:
+                        c["ctr"] = docker_names().get(c.get("cgroup", ""), "")
+            except Exception as e:
+                log("gpu_clients sudo 通道失败: %s" % e)
+
+    if src == "local":
+        for c in out:
+            c.setdefault("ctr", docker_names().get(c.get("cgroup", ""), ""))
+
+    _gpuc_cache["ts"] = now
+    _gpuc_cache["data"] = out
+    return out
 
 
 _ctr_cache = {"ts": 0.0, "data": None, "err": False}
@@ -493,6 +654,7 @@ def collect():
         "loadavg": read_file("/proc/loadavg", "-").split()[0:3],
         "uptime_s": int(float(read_file("/proc/uptime", "0").split()[0] or 0)),
         "sched_timeout": int(sh("dmesg 2>/dev/null | grep -c 'gpu sched timeout'") or 0),
+        "gpu_clients": gpu_clients(),
         "android": android_info(),
         "decoder": decoder_info(),
         "can_root": can_root(),
@@ -981,6 +1143,12 @@ window.addEventListener('unhandledrejection', function(e){
 </div>
 
 <div class="card" style="margin-bottom:16px">
+  <h2>② GPU 客户端（按进程归因）</h2>
+  <table id="gpuc"></table>
+  <div style="font-size:11px;color:var(--dim);margin-top:8px" id="gpucsub">读取中…</div>
+</div>
+
+<div class="card" style="margin-bottom:16px">
   <h2>硬件体检与一键修补</h2>
   <div class="rowflex">
     <div class="big" id="score">–<span class="unit">分</span></div>
@@ -1032,7 +1200,7 @@ window.addEventListener('unhandledrejection', function(e){
 
 <div class="warnbox" style="display:block;margin-top:12px">⚠️ <b>致命雷区警告</b>：本机的 <b>/dev/video26</b> 与 <b>/sys/class/vdec</b> 一旦被任何程序访问（哪怕只是 cat 读取），会立即造成整机内核死锁，只能物理断电恢复。本控制台仅做只读采集，已全程规避这两个路径；也请务必不要用其它工具或脚本去触碰它们。</div>
 
-<div class="foot">GPU 控制台 v1.1.0 · 默认只读监控，仅在你点击修补/切换按钮时才改配置 · 开发者与发布者：老汪不讲武德</div>
+<div class="foot">GPU 控制台 v1.3.0 · 默认只读监控，仅在你点击修补/切换按钮时才改配置 · 开发者与发布者：老汪不讲武德</div>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -1207,6 +1375,7 @@ function render(d){
           + '如需显示容器 GPU 占用，在应用配置中让运行用户加入 docker 组。</td></tr>'
         : '<tr><td colspan="2" style="color:var(--dim)">当前没有容器在使用 GPU</td></tr>');
 
+  renderGpuClients(d);
   renderAndroid(d);
 
   const risky = cs.filter(c => c.privileged).map(c => c.name);
@@ -1219,6 +1388,35 @@ function render(d){
   } else {
     $('warnbox').style.display = 'none';
   }
+}
+
+// ---------- GPU 客户端（按进程归因） ----------
+function renderGpuClients(d){
+  const gc = d.gpu_clients || [];
+  const el = $('gpuc');
+  if (!el) return;
+  if (!gc.length){
+    el.innerHTML = '<tr><td colspan="3" style="color:var(--dim)">当前没有进程持有 /dev/dri 节点'
+      + '（或该驱动未提供 DRM fdinfo）</td></tr>';
+    $('gpucsub').textContent = '本页数据来自 /proc/<pid>/fdinfo 的 drm-* 字段，只读采集';
+    return;
+  }
+  const total = gc.reduce((s, c) => s + c.res_mb, 0);
+  el.innerHTML = gc.map(c => {
+    const who = c.ctr
+      ? '<span class="tag t-info">' + c.ctr + '</span>'
+      : (c.cgroup ? '<span class="tag t-info">' + c.cgroup + '</span>' : '');
+    return '<tr><td>' + c.comm + ' <span style="color:var(--dim)">#' + c.pid + '</span> ' + who
+      + '<div style="font-size:11px;color:var(--dim)">' + c.dev + ' · ' + c.driver
+      + ' · client ' + c.cid + '</div></td>'
+      + '<td style="white-space:nowrap">' + c.res_mb + ' MB'
+      + '<div style="font-size:11px;color:var(--dim)">共享 ' + c.shared_mb + ' MB</div></td>'
+      + '<td style="white-space:nowrap">' + c.cur_mhz + ' / ' + c.max_mhz + ' MHz'
+      + '<div style="font-size:11px;color:var(--dim)">当前 / 上限</div></td>'
+      + '</tr>';
+  }).join('');
+  $('gpucsub').textContent = '共 ' + gc.length + ' 个 GPU 客户端，常驻显存合计 ' + total
+    + ' MB ｜ 数据来自内核 DRM fdinfo，只读采集';
 }
 
 // ---------- 安卓容器 GPU 详情 ----------
