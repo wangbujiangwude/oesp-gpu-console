@@ -18,8 +18,15 @@
 #   amvdec_formats.sh reset      # 清除防循环标记（人工确认安全后重试用）
 # ==============================================================================
 
+# ⛔ cron 的 PATH 只有 /usr/bin:/bin，而 modprobe 在 /usr/sbin ——
+#    不加这行，脚本手动跑正常、挂 cron 却全部 rc=127（2026-10-05 实测踩到）。
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
 STATE_DIR="${AMVDEC_STATE_DIR:-/usr/local/lib/oesp-gpu}"
 PENDING="$STATE_DIR/.amvdec_load_pending"
+
+# 解析一次绝对路径，避免 PATH 再次被环境覆盖
+MODPROBE="$(command -v modprobe 2>/dev/null || echo /usr/sbin/modprobe)"
 
 # 已实测可安全加载的格式模块（顺序：先保守后激进）
 # 注意拼写：MPEG1/2 与 MPEG4 是双 m（mmpeg），写成单 m 会 not found
@@ -74,7 +81,7 @@ mkdir -p "$STATE_DIR" 2>/dev/null
 echo "$BOOT" > "$PENDING" 2>/dev/null
 
 for m in $TODO; do
-    timeout 20 modprobe "$m" 2>&1
+    timeout 20 "$MODPROBE" "$m" 2>&1
     rc=$?
     if [ $rc -ne 0 ]; then
         echo "  $m 加载失败 rc=$rc（后续模块继续尝试）"
