@@ -48,6 +48,7 @@ import errno
 import fcntl
 import os
 import signal
+import socket
 import struct
 import sys
 import time
@@ -145,8 +146,50 @@ class Watchdog:
         self.fd = None
 
 
-def health_ok(check_pids):
-    """低成本健康探测：调度器与 VFS 是否还正常。"""
+def count_uninterruptible():
+    """统计处于 D 状态（不可中断睡眠，通常卡在内核/驱动里）的进程数。"""
+    n = 0
+    try:
+        for d in os.listdir("/proc"):
+            if not d.isdigit():
+                continue
+            try:
+                with open("/proc/%s/stat" % d, "rb") as f:
+                    data = f.read()
+            except OSError:
+                continue
+            # 字段名之后是 state，取 ')' 后第二个 token
+            rp = data.rfind(b")")
+            if rp < 0:
+                continue
+            parts = data[rp + 2:].split()
+            if parts and parts[0] == b"D":
+                n += 1
+    except OSError:
+        return -1
+    return n
+
+
+def port_alive(host, port, timeout=2.0):
+    """本机自连探测。
+
+    这是最关键的一项：2026-10-05 的 S_FMT 死锁事故中，整机没有冻结
+    （fork/读 /proc 全正常，守护照常喂狗，硬件 WDT 永不超时），
+    但网络栈与 sshd 已挂死，表现为对端 ConnectionRefused 且长时间不复原。
+    只有探测真实服务端口，才能发现这类「部分死锁」。
+    connect 挂起时由 socket 超时兜住（超时即判失败），不会拖住喂狗线程。
+    """
+    try:
+        s = socket.create_connection((host, port), timeout=timeout)
+        s.close()
+        return True
+    except OSError:
+        return False
+
+
+def health_ok(check_pids, check_addr=None, max_dstate=25):
+    """健康检查。任一探针失败即判定不健康。"""
+    # 1) 调度器 + VFS：fork 能成功并正常回收
     try:
         pid = os.fork()
         if pid == 0:
@@ -162,6 +205,29 @@ def health_ok(check_pids):
             f.read()
     except OSError as e:
         return False, "读 /proc/loadavg 失败: %s" % errno.errorcode.get(e.errno, e)
+
+    # 2) 调度延迟：sleep 1 秒实际耗时远超 → CPU 饥饿或调度器异常
+    t0 = time.monotonic()
+    time.sleep(1.0)
+    dt = time.monotonic() - t0
+    if dt > 4.0:
+        return False, "调度延迟异常（sleep 1s 实际 %.1fs）" % dt
+
+    # 3) 本机服务端口自连（发现「部分死锁」的关键项）
+    if check_addr:
+        host, _, port_s = check_addr.rpartition(":")
+        try:
+            port = int(port_s)
+        except ValueError:
+            return False, "check-addr 格式错误: %s" % check_addr
+        if not port_alive(host, port):
+            return False, "本机 %s:%d 不可连（网络栈或服务已挂）" % (host, port)
+
+    # 4) D 状态进程堆积：说明有进程卡在内核里出不来
+    if max_dstate > 0:
+        n = count_uninterruptible()
+        if n > max_dstate:
+            return False, "D 状态进程 %d 个（> %d），疑似内核卡死" % (n, max_dstate)
 
     for p in check_pids:
         if not os.path.isdir("/proc/%d" % p):
@@ -221,8 +287,9 @@ def cmd_firetest(a):
 def cmd_daemon(a):
     w = Watchdog(a.dev, a.timeout)
     w.open()
-    log("守护已启动 dev=%s timeout=%s interval=%s check=%s"
-        % (a.dev, sysfs_read("timeout"), a.interval, a.check))
+    log("守护已启动 dev=%s timeout=%s interval=%s check=%s addr=%s max_dstate=%s"
+        % (a.dev, sysfs_read("timeout"), a.interval, a.check,
+           a.check_addr if a.check else "-", a.max_dstate))
 
     stop = {"v": False}
 
@@ -236,7 +303,8 @@ def cmd_daemon(a):
     fails = 0
     while not stop["v"]:
         if a.check:
-            ok, why = health_ok(a.pid)
+            addr = None if a.check_addr.lower() == "none" else a.check_addr
+            ok, why = health_ok(a.pid, addr, a.max_dstate)
             if not ok:
                 fails += 1
                 log("健康检查失败 %d/%d：%s" % (fails, a.check_fail, why))
@@ -258,19 +326,51 @@ def cmd_daemon(a):
     return 0
 
 
+def cmd_probe(a):
+    """零风险验证：只做一次健康检查，不开看门狗、不会复位。
+
+    用途：确认「上次那种 SSH 都连不上」的故障能否被健康探针捕捉到。
+    """
+    addr = None if a.check_addr.lower() == "none" else a.check_addr
+    ok, why = health_ok(a.pid, addr, a.max_dstate)
+    print("健康检查判定 : %s（%s）" % ("健康" if ok else "不健康 → 守护会停喂狗并触发硬件复位", why))
+    if addr:
+        host, _, port_s = addr.rpartition(":")
+        try:
+            alive = port_alive(host, int(port_s))
+        except ValueError:
+            alive = None
+        print("  端口自连 %s : %s" % (addr, "通" if alive else "不通" if alive is False else "地址格式错"))
+    print("  D 状态进程  : %d（阈值 %d）" % (count_uninterruptible(), a.max_dstate))
+    with open("/proc/loadavg") as f:
+        print("  loadavg     : %s" % f.read().strip())
+    return 0 if ok else 2
+
+
 def main():
     p = argparse.ArgumentParser(description="OESP 硬件看门狗守护")
-    p.add_argument("mode", choices=["daemon", "selftest", "firetest", "status"])
+    p.add_argument("mode", choices=["daemon", "selftest", "firetest", "status", "probe"])
     p.add_argument("--dev", default=DEFAULT_DEV)
     p.add_argument("--timeout", type=int, default=None, help="看门狗超时秒数（最小 1）")
     p.add_argument("--interval", type=float, default=5.0, help="喂狗间隔秒数")
-    p.add_argument("--check", action="store_true", help="开启健康检查")
+    # ⛔ 默认开启：2026-10-05 事故就是部署时漏了 --check，守护只喂狗不判断，
+    #    结果「部分死锁」时它照常喂狗，硬件 WDT 永不超时，机器卡死 45 分钟。
+    p.add_argument("--no-check", dest="check", action="store_false",
+                   help="关闭健康检查（不推荐，仅用于调试）")
     p.add_argument("--check-fail", type=int, default=3, help="连续失败几次后触发复位")
+    p.add_argument("--check-addr", default="127.0.0.1:22",
+                   help="本机自连探测地址，用于发现网络栈/服务挂死的「部分死锁」"
+                        "（默认 127.0.0.1:22；设为 none 可关闭该项）")
+    p.add_argument("--max-dstate", type=int, default=25,
+                   help="D 状态进程数阈值，超过即判不健康（0 关闭）")
     p.add_argument("--pid", type=int, action="append", default=[], help="需要存活的关键进程 PID，可重复")
+    p.set_defaults(check=True)
     a = p.parse_args()
 
     if a.mode == "status":
         return cmd_status(a)
+    if a.mode == "probe":
+        return cmd_probe(a)
     if os.geteuid() != 0:
         print("需要 root 权限（打开 %s）" % a.dev, file=sys.stderr)
         return 1
