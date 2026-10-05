@@ -36,7 +36,7 @@ try:
 except Exception:
     fcntl = None
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 APP_NAME = "gpuconsole"
 
 APP_DEST = os.environ.get("TRIM_APPDEST", "/var/apps/gpuconsole/target")
@@ -301,6 +301,12 @@ def _scan_local():
             except Exception:
                 comm = "?"
             cgrp = _cgroup_of(pid)
+            # ⚠ 显存不能简单求和：同一进程常持有多个 drm client（如 surfaceflinger 2 个），
+            #   且 total/resident 含【跨 client 共享】部分。上层用「独占 + 共享峰值」去重估算。
+            cf = mhz("drm-curfreq-fragment")
+            mf = mhz("drm-maxfreq-fragment")
+            cv = mhz("drm-curfreq-vertex-tiler")
+            mv = mhz("drm-maxfreq-vertex-tiler")
             seen[k] = {
                 "ctr": docker_names().get(cgrp, ""),
                 "pid": int(pid),
@@ -311,8 +317,10 @@ def _scan_local():
                 "res_mb": kb("drm-resident-memory") // 1024,
                 "shared_mb": kb("drm-shared-memory") // 1024,
                 "total_mb": kb("drm-total-memory") // 1024,
-                "cur_mhz": mhz("drm-curfreq-fragment") or mhz("drm-curfreq-vertex-tiler"),
-                "max_mhz": mhz("drm-maxfreq-fragment") or mhz("drm-maxfreq-vertex-tiler"),
+                "cur_frag_mhz": cf, "max_frag_mhz": mf,
+                "cur_vert_mhz": cv, "max_vert_mhz": mv,
+                "cur_mhz": cf or cv,
+                "max_mhz": mf or mv,
                 "cgroup": cgrp,
             }
 
@@ -1414,15 +1422,44 @@ function render(d){
 // ---------- GPU 客户端（按进程归因） ----------
 // 该面板默认折叠：只占一行标题，不挤占主控制台版面；
 // 摘要（客户端数 / 常驻显存合计）始终随 2 秒轮询更新，表格仅在展开时渲染。
+// GPU 显存去重估算：Σ(client 独占) + 共享峰值。
+// （DRM fdinfo 的 resident/total 含跨 client 共享部分，直接相加会重复计数。）
+function gpuMemDedup(gc){
+  let excl = 0, peak = 0;
+  for (const c of gc){
+    const sh = c.shared_mb || 0, rs = c.res_mb || 0;
+    excl += Math.max(0, rs - sh);
+    if (sh > peak) peak = sh;
+  }
+  return excl + peak;
+}
+// 频率利用率：panfrost 未实现 drm-engine-* 周期计数，拿不到真实利用率百分比，
+// 只能用「当前频率 / 上限频率」作为忙闲代理（125/800 MHz ≈ 空闲，800/800 ≈ 满载）。
+function freqPct(cur, max){
+  if (!max || max <= 0) return null;
+  return Math.round((cur || 0) * 100 / max);
+}
+function freqCell(c){
+  const f = freqPct(c.cur_frag_mhz || c.cur_mhz, c.max_frag_mhz || c.max_mhz);
+  const v = freqPct(c.cur_vert_mhz, c.max_vert_mhz);
+  let s = (c.cur_frag_mhz || c.cur_mhz || 0) + ' / ' + (c.max_frag_mhz || c.max_mhz || 0) + ' MHz';
+  s += '<div style="font-size:11px;color:var(--dim)">片元';
+  if (f !== null) s += ' ' + f + '%';
+  if (v !== null && c.max_vert_mhz) s += ' ｜ 顶点 ' + (c.cur_vert_mhz || 0) + '/' + c.max_vert_mhz + ' (' + v + '%)';
+  s += '</div>';
+  return s;
+}
 function renderGpuClients(d){
   const gc = d.gpu_clients || [];
   const el = $('gpuc'), fold = $('gpucFold');
   if (!el || !fold) return;
-  const total = gc.reduce((s, c) => s + c.res_mb, 0);
+  // ⚠ 不能直接 sum(res_mb)：同一进程常持有多个 drm client，且驻留量含跨 client 共享部分。
+  //   去重估算 = 各 client【独占】之和 + 共享峰值（共享部分只计一次）。
+  const total = gpuMemDedup(gc);
   const brief = $('gpucBrief');
   if (brief){
     brief.textContent = gc.length
-      ? (gc.length + ' 个客户端 · 常驻 ' + total + ' MB')
+      ? (gc.length + ' 个客户端 · 常驻 ≈ ' + total + ' MB')
       : '无进程占用';
     brief.style.color = gc.length ? 'var(--blue)' : 'var(--dim)';
   }
@@ -1442,12 +1479,12 @@ function renderGpuClients(d){
       + ' · client ' + c.cid + '</div></td>'
       + '<td style="white-space:nowrap">' + c.res_mb + ' MB'
       + '<div style="font-size:11px;color:var(--dim)">共享 ' + c.shared_mb + ' MB</div></td>'
-      + '<td style="white-space:nowrap">' + c.cur_mhz + ' / ' + c.max_mhz + ' MHz'
-      + '<div style="font-size:11px;color:var(--dim)">当前 / 上限</div></td>'
+      + freqCell(c)
       + '</tr>';
   }).join('');
-  $('gpucsub').textContent = '共 ' + gc.length + ' 个 GPU 客户端，常驻显存合计 ' + total
-    + ' MB ｜ 数据来自内核 DRM fdinfo，只读采集';
+  $('gpucsub').textContent = '共 ' + gc.length + ' 个 GPU 客户端，常驻显存 ≈ ' + total
+    + ' MB（已按「独占 + 共享峰值」去重估算）｜ 数据来自内核 DRM fdinfo，只读采集；'
+    + 'panfrost 未提供引擎周期计数，真实利用率无法读取，此处用频率比代理';
 }
 
 // ---------- 安卓容器 GPU 详情 ----------

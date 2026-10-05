@@ -819,6 +819,13 @@ for pid in pids:
         cid = info.get("drm-client-id", fd)
         if (pid, cid) in seen:
             continue
+        # ⚠ 显存不能简单求和：同一进程常持有多个 drm client（如 surfaceflinger 2 个），
+        #   且 drm-total/resident 含【跨 client 共享】的部分，直接相加会重复计数。
+        #   因此同时输出 shared，由上层做「独占 + 共享峰值」的去重估算。
+        cf = mhz(info, "drm-curfreq-fragment")
+        mf = mhz(info, "drm-maxfreq-fragment")
+        cv = mhz(info, "drm-curfreq-vertex-tiler")
+        mv = mhz(info, "drm-maxfreq-vertex-tiler")
         seen[(pid, cid)] = {
             "pid": int(pid),
             "comm": rf("/proc/%s/comm" % pid).strip() or "?",
@@ -828,8 +835,11 @@ for pid in pids:
             "res_mb": num(info, "drm-resident-memory") // 1024,
             "shared_mb": num(info, "drm-shared-memory") // 1024,
             "total_mb": num(info, "drm-total-memory") // 1024,
-            "cur_mhz": mhz(info, "drm-curfreq-fragment") or mhz(info, "drm-curfreq-vertex-tiler"),
-            "max_mhz": mhz(info, "drm-maxfreq-fragment") or mhz(info, "drm-maxfreq-vertex-tiler"),
+            # 频率分两个电源域：片元(fragment) 与 顶点/tiler(vertex-tiler)
+            "cur_frag_mhz": cf, "max_frag_mhz": mf,
+            "cur_vert_mhz": cv, "max_vert_mhz": mv,
+            "cur_mhz": cf or cv,
+            "max_mhz": mf or mv,
             "cgroup": cgroup_of(pid),
         }
 
