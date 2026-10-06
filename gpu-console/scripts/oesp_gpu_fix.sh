@@ -71,6 +71,157 @@ cmdexec() {  # cmdexec <timeout> <cmd...>  在容器内执行并取输出首行
     docker exec "$CTR" timeout "$t" "$@" 2>/dev/null | head -1
 }
 
+# ==============================================================================
+#  ge2d（Amlogic 2D 加速单元）
+# ------------------------------------------------------------------------------
+#  ⛔ 两个 G12B 专属陷阱（都是实测踩出来的，别当成"理论上应该能跑"）：
+#    ① 主线驱动按 AXG 的方式写 BADDR，G12 必须用 canvas 索引 → 原版【跑完不出图】；
+#       现象极具迷惑性：ioctl 全成功、中断照常响，只是目标缓冲一个字节没被写。
+#       ⇒ 判断"能用"唯一可信的方法是逐像素比对，所以有了 ge2d_selftest。
+#    ② vapb_sel 带 CLK_SET_RATE_NO_REPARENT → clk_set_rate 拿不到 500MHz（会 round 回 250MHz），
+#       必须在 probe 里 clk_set_parent 切到 vapb_1。所以模块参数写成 ge2d_clk_rate=500000000。
+#  能力边界（源码 Missing features 实锤）：❌ 无缩放  ❌ 无 YUV/NV12 输入  ❌ 无色度转换。
+#  ⇒ 不要指望它替掉 OMX ANW 里的 NEON NV12→RGBA，它只能做 RGB↔RGB 的搬运/格式转换。
+# ==============================================================================
+GE2D_KO="/usr/local/lib/oesp-gpu/ge2d_oesp.ko"
+GE2D_BIN="/usr/local/lib/oesp-gpu/ge2d_selftest"
+GE2D_SRC="/usr/local/lib/oesp-gpu/ge2d/ge2d_selftest.c"
+GE2D_LOADED=0; GE2D_MOD=""; GE2D_PATCHED=0; GE2D_DEV=""; GE2D_CLK=-1; GE2D_IRQ=0
+
+ge2d_probe_dev() {
+    GE2D_LOADED=0; GE2D_MOD=""; GE2D_PATCHED=0; GE2D_DEV=""; GE2D_CLK=-1; GE2D_IRQ=0
+    if mod_loaded ge2d_oesp; then
+        GE2D_LOADED=1; GE2D_MOD="ge2d_oesp"; GE2D_PATCHED=1
+    elif mod_loaded ge2d; then
+        GE2D_LOADED=1; GE2D_MOD="ge2d"; GE2D_PATCHED=0
+    fi
+    # ⛔ 设备编号不固定（ge2d 启用后它会抢到 video0，硬解顺延到 video1）→ 一律按 name 定位
+    local d n
+    for d in /sys/class/video4linux/video*; do
+        [ -f "$d/name" ] || continue
+        n=$(cat "$d/name" 2>/dev/null)
+        case "$n" in *ge2d*) GE2D_DEV="/dev/$(basename "$d")" ;; esac
+    done
+    # 时钟：优先读模块参数（最可靠），再看 debugfs 的 vapb
+    local pr=""
+    pr=$(cat /sys/module/ge2d_oesp/parameters/ge2d_clk_rate 2>/dev/null)
+    if [ -n "$pr" ]; then
+        GE2D_CLK=$(( pr / 1000000 ))
+    elif [ -r /sys/kernel/debug/clk/clk_summary ]; then
+        local v
+        v=$(awk 'NF>5 { for(i=1;i<=NF;i++) if($i ~ /ge2d$/) { print int($5/1000000); exit } }' \
+            /sys/kernel/debug/clk/clk_summary 2>/dev/null)
+        [ -n "$v" ] && GE2D_CLK=$v
+    fi
+    # ⚠ 不能用 irq()（它按 $NF 精确匹配，而这里行尾是 ff940000.ge2d 不是 ge2d）
+    GE2D_IRQ=$(awk '/ge2d/ {s=0; for(i=2;i<=7;i++) s+=$i; print s+0; exit}' /proc/interrupts 2>/dev/null)
+    [ -z "$GE2D_IRQ" ] && GE2D_IRQ=0
+}
+
+ge2d_run_selftest() {   # ge2d_run_selftest [边长] [次数]
+    local side="${1:-512}" rep="${2:-10}"
+    if [ ! -x "$GE2D_BIN" ]; then
+        if [ ! -f "$GE2D_SRC" ] && [ -f "$SELF_DIR/ge2d_selftest.c" ]; then
+            mkdir -p /usr/local/lib/oesp-gpu/ge2d 2>/dev/null
+            cp "$SELF_DIR/ge2d_selftest.c" "$GE2D_SRC" 2>/dev/null
+        fi
+        if [ -f "$GE2D_SRC" ] && have gcc; then
+            gcc -O2 -o "$GE2D_BIN" "$GE2D_SRC" 2>/dev/null && chmod 755 "$GE2D_BIN" 2>/dev/null
+        fi
+    fi
+    [ -x "$GE2D_BIN" ] || return 1
+    timeout 30 "$GE2D_BIN" "$side" "$rep" 2>/dev/null
+}
+
+# ---- VDEC 设备节点定位 ------------------------------------------------------
+# ⛔ 绝不能写死 /dev/video0：ge2d 启用后它会【抢走 video0】，硬解顺延成 video1
+#    （2026-10-06 就因为这个：体检一直检查 ge2d 的权限，真正的硬解设备没人管，
+#     容器内 /dev/video1 是 600 → 硬解静默失效，而控制台还显示"正常"）。
+# ⛔ 同时必须排除 video26（aml-vcodec-dec 雷区，open 相关操作会整机内核死锁）。
+#    只读 /sys/class/video4linux/*/name 是安全的（白名单操作）。
+VDEC_DEV=""
+vdec_dev_node() {
+    VDEC_DEV=""
+    local d n
+    for d in /sys/class/video4linux/video*; do
+        [ -f "$d/name" ] || continue
+        n=$(cat "$d/name" 2>/dev/null)
+        case "$n" in
+            *ge2d*) continue ;;         # 2D 加速单元，不是解码器
+            *aml-vcodec*) continue ;;   # ⛔ 雷区
+        esac
+        case "$n" in
+            *meson-video-decoder*|*meson-vdec*|*vdec*) VDEC_DEV="/dev/$(basename "$d")" ;;
+        esac
+    done
+}
+
+ge2d_status_json() {
+    ge2d_probe_dev
+    local st=0; [ -x "$GE2D_BIN" ] && st=1
+    echo "{"
+    echo " \"loaded\":$GE2D_LOADED,\"module\":\"$GE2D_MOD\",\"patched\":$GE2D_PATCHED,"
+    echo " \"dev\":\"$GE2D_DEV\",\"clk_mhz\":$GE2D_CLK,\"irq\":$GE2D_IRQ,\"selftest_bin\":$st,"
+    echo " \"ko_path\":\"$GE2D_KO\",\"scaling\":false,\"yuv\":false"
+    echo "}"
+}
+
+ge2d_fix_json() {   # 需要 root
+    if [ "$IS_ROOT" != "1" ]; then
+        echo "{\"ok\":false,\"msg\":\"需要 root：请用 sudo 执行\"}"; return 1
+    fi
+    if [ ! -f "$GE2D_KO" ]; then
+        echo "{\"ok\":false,\"msg\":\"补丁模块缺失：$GE2D_KO\"}"; return 1
+    fi
+    # ⚠ 速率检查必须放在"是否已加载"之外：已加载但仍是 250MHz 时也要纠正
+    if [ "$(cat /sys/module/ge2d_oesp/parameters/ge2d_clk_rate 2>/dev/null)" != "500000000" ]; then
+        rmmod ge2d_oesp 2>/dev/null || true
+    fi
+    if ! mod_loaded ge2d_oesp; then
+        mod_loaded ge2d && rmmod ge2d 2>/dev/null || true
+        insmod "$GE2D_KO" ge2d_clk_rate=500000000 >/dev/null 2>&1
+    fi
+    sleep 1
+    ge2d_probe_dev
+    # ⚠ 自检结果必须【平铺】成标量再输出：把整段自检 JSON 嵌套进 msg/字段里会带转义引号，
+    #   上层用 "取最后一对花括号" 的方式解析时会被嵌套的 { 骗到，直接解析失败（实测踩过）。
+    local out=""; out=$(ge2d_run_selftest 128 3 2>/dev/null)
+    local st_ok=0 st_mpx=0 st_mm=-1 st_zero=0
+    if [ -n "$out" ]; then
+        printf '%s' "$out" | grep -q '"ok":true' && st_ok=1
+        printf '%s' "$out" | grep -q '"all_zero":true' && st_zero=1
+        st_mpx=$(printf '%s' "$out" | sed -n 's/.*"mpx_s":\([0-9.]*\).*/\1/p')
+        st_mm=$(printf '%s' "$out" | sed -n 's/.*"mismatch":\([0-9]*\).*/\1/p')
+    fi
+    [ -z "$st_mpx" ] && st_mpx=0
+    [ -z "$st_mm" ] && st_mm=-1
+    echo "{\"ok\":$GE2D_LOADED,\"module\":\"$GE2D_MOD\",\"dev\":\"$GE2D_DEV\",\"clk_mhz\":$GE2D_CLK,"
+    echo " \"selftest_ok\":$st_ok,\"selftest_zero\":$st_zero,\"mismatch\":$st_mm,\"mpx_s\":$st_mpx}"
+}
+
+# ---- GPU（Mali-G52）频率下限 -------------------------------------------------
+# 实测：本机 devfreq 只有 simple_ondemand，GPU 长期被钉在最低档 124MHz（max 799MHz），
+#       即使 panfrost-job 中断在增长（= GPU 确实在干活）也不升频。
+#       抬 min_freq 即可让 cur 立刻跟随；写回 124999998 完全回滚。不改 governor、不碰电压。
+gpu_freq_json() {   # gpu_freq_json [status|auto|500|666|800]
+    local g=/sys/class/devfreq/ffe40000.gpu
+    [ -d "$g" ] || { echo "{\"ok\":false,\"msg\":\"无 devfreq 节点（非 G12 平台？）\"}"; return 1; }
+    local arg="${1:-status}" w=0
+    case "$arg" in
+        auto) echo 124999998 > "$g/min_freq" 2>/dev/null && w=1 ;;
+        500)  echo 500000000 > "$g/min_freq" 2>/dev/null && w=1 ;;
+        666)  echo 666666656 > "$g/min_freq" 2>/dev/null && w=1 ;;
+        800)  echo 799999987 > "$g/min_freq" 2>/dev/null && w=1 ;;
+    esac
+    [ "$w" = "1" ] && sleep 1
+    local cur=$(( $(cat "$g/cur_freq" 2>/dev/null || echo 0) / 1000000 ))
+    local min=$(( $(cat "$g/min_freq" 2>/dev/null || echo 0) / 1000000 ))
+    local max=$(( $(cat "$g/max_freq" 2>/dev/null || echo 0) / 1000000 ))
+    local gov; gov=$(cat "$g/governor" 2>/dev/null)
+    local pin=false; [ "$cur" = "$min" ] && [ "$min" != "$max" ] && pin=true
+    echo "{\"ok\":true,\"cur_mhz\":$cur,\"min_mhz\":$min,\"max_mhz\":$max,\"governor\":\"$gov\",\"pinned_low\":$pin,\"set\":\"$arg\"}"
+}
+
 PASS=0; FAIL=0; WARN=0
 ok()   { echo "  [PASS] $*"; PASS=$((PASS+1)); }
 bad()  { echo "  [FAIL] $*"; FAIL=$((FAIL+1)); }
@@ -129,7 +280,10 @@ detect() {
     # ---------- 宿主：VDEC ----------
     local vmod=0 vnode=0 vperm=""
     mod_loaded meson_vdec && vmod=1
-    [ -e /dev/video0 ] && vnode=1 && vperm=$(perm /dev/video0)
+    vdec_dev_node
+    if [ -n "$VDEC_DEV" ]; then
+        vnode=1; vperm=$(perm "$VDEC_DEV")
+    fi
 
     if [ "$vmod" = "1" ]; then
         add H1 host ok "meson-vdec 模块" "已加载（vdec 中断 $(irq vdec)）"
@@ -139,14 +293,14 @@ detect() {
         [ "$MODE" = text ] && bad "meson-vdec 未加载"
     fi
     if [ "$vnode" = "1" ]; then
-        local vn=$(cat /sys/class/video4linux/video0/name 2>/dev/null)
+        local vn=$(cat "/sys/class/video4linux/$(basename "$VDEC_DEV")/name" 2>/dev/null)
         if [ "$vperm" = "666" ]; then
-            add H3 host ok "/dev/video0 权限" "$vn（$vperm）"
+            add H3 host ok "硬解设备权限（宿主）" "$VDEC_DEV = $vn（$vperm）"
         else
-            add H3 host warn "/dev/video0 权限" "$vn 当前 $vperm，容器 media.codec(uid 1046) 可能无权打开" "chmod 666 /dev/video0" 1
+            add H3 host warn "硬解设备权限（宿主）" "$VDEC_DEV = $vn 当前 $vperm，容器 media.codec(uid 1046) 可能无权打开" "chmod 666 $VDEC_DEV" 1
         fi
     else
-        add H3 host fail "/dev/video0" "不存在" "modprobe meson-vdec" 1
+        add H3 host fail "硬解设备" "未找到 meson-video-decoder 节点" "modprobe meson-vdec" 1
     fi
 
     local al=0
@@ -187,27 +341,70 @@ detect() {
         add H10 host warn "GPU 设备 udev 规则" "未配置，容器权限依赖手动 chmod" "写入 99-oesp-gpu.rules" 1
     fi
 
-    # ---- H11 厂商解码栈格式模块（amvdec_*）----
-    # 飞牛官方只加载框架 amvdec_ports，具体格式模块默认不加载，
-    # 导致 HEVC / AV1 / VP9 / AVS2 等硬件解码器空置。实测这些模块可安全加载。
+    # ---- H11 厂商解码栈（amvdec_*）----
+    # ⚠⚠ 结论已翻转（2026-10-06）：厂商栈是【雷区】，不是"待补的功能"，别再引导用户去加载。
+    #   实测：/dev/video26（aml-vcodec-dec）S_FMT/REQBUFS/STREAMON 必死锁（整机停摆）；
+    #         /sys/class/vdec/* 只读 cat 也死锁。
+    #   而社区 meson-vdec 已覆盖 H.264 + VP9（VP9 与 ffmpeg 软解逐字节一致），够用。
+    #   ⇒ 格式模块"未加载"才是正确状态，加载了反而要提醒。
     # ⚠ 用 /proc/modules 而不是 lsmod（lsmod 在 /usr/sbin，应用用户 PATH 里没有）
-    if ! grep -q "^amvdec_ports " /proc/modules 2>/dev/null; then
-        add H11 host warn "厂商解码栈框架" "amvdec_ports 未加载，厂商全格式解码不可用" "modprobe amvdec_ports" 1
+    local fm_ok=0 fm_list=""
+    for m in amvdec_mmpeg12 amvdec_h265 amvdec_av1 amvdec_vp9 amvdec_avs2 amvdec_vc1 amvdec_mmjpeg amvdec_mmpeg4; do
+        if grep -q "^${m} " /proc/modules 2>/dev/null; then
+            fm_ok=$((fm_ok + 1)); fm_list="$fm_list $m"
+        fi
+    done
+    if [ "$fm_ok" -gt 0 ]; then
+        add H11 host warn "厂商解码栈（雷区）" \
+            "$fm_ok/8 个格式模块【已加载】：$fm_list —— /dev/video26 一旦被访问即整机死锁，建议保持卸载" \
+            "卸载 amvdec_* 格式模块（勿在硬解运行时操作）" 1
     else
-        local fm_ok=0 fm_miss=""
-        for m in amvdec_mmpeg12 amvdec_h265 amvdec_av1 amvdec_vp9 amvdec_avs2 amvdec_vc1 amvdec_mmjpeg amvdec_mmpeg4; do
-            if grep -q "^${m} " /proc/modules 2>/dev/null; then
-                fm_ok=$((fm_ok + 1))
-            else
-                fm_miss="$fm_miss $m"
-            fi
-        done
-        if [ "$fm_ok" -eq 8 ]; then
-            add H11 host ok "厂商解码格式模块" "8/8 已加载（HEVC/AV1/VP9/AVS2/VC1/MJPEG/MPEG4/MPEG12）"
-        elif [ "$fm_ok" -gt 0 ]; then
-            add H11 host warn "厂商解码格式模块" "$fm_ok/8 已加载，缺:$fm_miss" "bash /usr/local/lib/oesp-gpu/amvdec_formats.sh" 1
+        add H11 host ok "厂商解码栈（雷区）" \
+            "格式模块未加载（正确：社区 meson-vdec 已覆盖 H.264/VP9，厂商栈 S_FMT 即死锁）"
+    fi
+
+    # ---- H12/H13/H14 ge2d 2D 图形加速 ----
+    # ⚠ 两条必须记住的事实：
+    #   ① 主线 ge2d 驱动在 G12A/G12B 上【不出图】——它按 AXG 写 BADDR，而 G12 必须用 canvas 索引
+    #      寻址。后果极具迷惑性：命令照常完成、中断照常响、但目标缓冲一个字节都没被写。
+    #      → 所以体检不能只看"模块加载着"，必须真的跑一次像素比对（H14）。
+    #   ② 驱动不认 clk_set_rate（vapb_sel 带 CLK_SET_RATE_NO_REPARENT），500MHz 只能在 probe 时
+    #      用参数 ge2d_clk_rate=500000000 配合 clk_set_parent 切到 vapb_1 才拿得到。
+    ge2d_probe_dev
+    if [ "$GE2D_LOADED" != "1" ]; then
+        add H12 host warn "2D 加速 ge2d" "模块未加载，2D 加速不可用（不影响 3D 与硬解）" "加载 canvas 补丁版 ge2d_oesp（500MHz）" 1
+        [ "$MODE" = text ] && warn "ge2d 2D 加速：模块未加载"
+    else
+        if [ "$GE2D_PATCHED" = "1" ]; then
+            add H12 host ok "2D 加速 ge2d" "已加载 ${GE2D_MOD}（canvas 补丁版），设备 ${GE2D_DEV:-未就绪}"
+            [ "$MODE" = text ] && ok "ge2d 2D 加速：${GE2D_MOD} 已加载（canvas 补丁版）"
         else
-            add H11 host fail "厂商解码格式模块" "0/8，厂商解码器全部空置（社区栈只支持 H.264）" "bash /usr/local/lib/oesp-gpu/amvdec_formats.sh" 1
+            add H12 host fail "2D 加速 ge2d" "加载的是原版 ${GE2D_MOD}（无 canvas 支持）—— 在 G12B 上跑完不出图" "换成 /usr/local/lib/oesp-gpu/ge2d_oesp.ko" 1
+            [ "$MODE" = text ] && bad "ge2d：原版模块无 canvas 支持，在 G12B 上不出图"
+        fi
+        # H13 时钟
+        if [ "$GE2D_CLK" = "500" ]; then
+            add H13 host ok "ge2d 时钟" "vapb 500MHz（vapb_1 分支，已切父时钟）"
+            [ "$MODE" = text ] && ok "ge2d 时钟 = 500MHz"
+        elif [ "$GE2D_CLK" = "-1" ]; then
+            add H13 host warn "ge2d 时钟" "读不到（debugfs 未挂载），无法确认" "" 0
+        else
+            add H13 host warn "ge2d 时钟" "当前 ${GE2D_CLK}MHz，低于 500MHz（vapb_sel 默认挂在 250MHz 的 vapb_0）" "用 ge2d_clk_rate=500000000 重载 ge2d_oesp" 1
+            [ "$MODE" = text ] && warn "ge2d 时钟 = ${GE2D_CLK}MHz（建议 500MHz）"
+        fi
+        # H14 真跑一次像素比对（128x128 x3，约 1~2ms，足够便宜且能抓到"跑通却全零"）
+        if [ "$MODE" = json ]; then
+            local st=""
+            st=$(ge2d_run_selftest 128 3 2>/dev/null)
+            if printf '%s' "$st" | grep -q '"ok":true'; then
+                add H14 host ok "ge2d 自检" "硬件转换与 CPU 参考逐像素一致"
+            elif printf '%s' "$st" | grep -q 'all_zero":true'; then
+                add H14 host fail "ge2d 自检" "输出全为零 —— canvas 寻址失效，补丁没生效" "重载 /usr/local/lib/oesp-gpu/ge2d_oesp.ko" 1
+            elif [ -n "$st" ]; then
+                add H14 host fail "ge2d 自检" "像素比对不一致：$(printf '%s' "$st" | sed 's/.*"msg":"//; s/".*//')" "重载 ge2d_oesp 后重试" 1
+            else
+                add H14 host warn "ge2d 自检" "自检程序不可用（二进制缺失且无法现场编译）" "在 SSH 里 gcc 编译 ge2d_selftest.c" 1
+            fi
         fi
     fi
 
@@ -306,12 +503,15 @@ detect() {
             add C6 container fail "media_codecs 注册" "缺少 OMX.meson 条目，App 只能选软解" "补写 media_codecs.xml" 0
         fi
 
-        # 容器内设备权限
-        local cvp=$(docker exec "$CTR" stat -c %a /dev/video0 2>/dev/null | tr -dc '0-9')
-        if [ "$cvp" = "666" ]; then
-            add C7 container ok "容器内 /dev/video0" "权限 666（media.codec 可打开）"
+        # 容器内设备权限（⛔ 按宿主实际 VDEC 节点检查，不写死 video0）
+        local cvp=""
+        [ -n "$VDEC_DEV" ] && cvp=$(docker exec "$CTR" stat -c %a "$VDEC_DEV" 2>/dev/null | tr -dc '0-9')
+        if [ -n "$VDEC_DEV" ] && [ "$cvp" = "666" ]; then
+            add C7 container ok "容器内 $VDEC_DEV" "权限 666（media.codec 可打开）"
+        elif [ -z "$VDEC_DEV" ]; then
+            add C7 container warn "容器内硬解设备" "宿主未找到 meson-video-decoder 节点" "modprobe meson-vdec" 1
         else
-            add C7 container fail "容器内 /dev/video0" "权限 ${cvp:-未知}，硬解会静默失效" "docker exec chmod 666 /dev/video0" 0
+            add C7 container fail "容器内 $VDEC_DEV" "权限 ${cvp:-未知}，硬解会静默失效" "docker exec chmod 666 $VDEC_DEV" 0
         fi
 
         local ctp=$(docker exec "$CTR" stat -c %a /data/local/tmp 2>/dev/null | tr -dc '0-9')
@@ -322,11 +522,16 @@ detect() {
         fi
 
         # 预热参数
+        # ⚠ 结论已变（2026-10-06）：自愈脚本刻意【不再】写 debug.meson.prelude/drop/tail。
+        #   这是全局属性，会覆盖插件【按格式】的默认值 —— H.264 与 VP9 需要不同的 prelude，
+        #   写一个全局 2 反而会让另一个格式退化。所以"未设置"才是正确状态，别再提示用户 setprop。
         local pl=$(ctrprop debug.meson.prelude)
-        if [ "$pl" = "2" ]; then
-            add C10 container ok "硬解预热参数" "debug.meson.prelude=2"
+        if [ "$(decoder_mode)" = "soft" ]; then
+            add C10 container ok "硬解预热参数" "软解模式，无需预热参数"
+        elif [ -n "$pl" ] && [ "$pl" != "0" ] && [ "$pl" != "" ]; then
+            add C10 container warn "硬解预热参数" "debug.meson.prelude=$pl（遗留值，会覆盖插件按格式的默认值）" "重建容器或 setprop debug.meson.prelude 0" 0
         else
-            add C10 container warn "硬解预热参数" "debug.meson.prelude=${pl:-未设置}（重建容器后会丢）" "setprop 写回" 0
+            add C10 container ok "硬解预热参数" "未设置（正确：由插件按格式自行决定）"
         fi
     fi
 
@@ -362,7 +567,7 @@ detect() {
     if [ "$CTR_UP" = "1" ]; then
         local priv=$(docker inspect "$CTR" --format '{{.HostConfig.Privileged}}' 2>/dev/null)
         if [ "$priv" = "true" ]; then
-            add R1 risk warn "特权容器暴露雷区" "$CTR 为 privileged，容器内可见 /dev/video26；一旦访问即整机内核死锁" "改用 --device=/dev/video0 最小权限" 0
+            add R1 risk warn "特权容器暴露雷区" "$CTR 为 privileged，容器内可见 /dev/video26；一旦访问即整机内核死锁" "改用 --device=${VDEC_DEV:-/dev/videoN} --device=/dev/dri/renderD128 最小权限（实测去 privileged 后 redroid 起不来，故仅提示）" 0
         fi
     fi
 }
@@ -390,15 +595,19 @@ fix_container() {
     sec "容器层修补（无需 root，有 docker 权限即可）"
     [ "$CTR_UP" = "1" ] || { warn "容器 $CTR 未运行，跳过"; return 0; }
 
-    # 设备与目录权限
-    docker exec "$CTR" chmod 666 /dev/video0 2>/dev/null && ok "容器内 /dev/video0 → 666" || warn "chmod /dev/video0 失败"
+    # 设备与目录权限（⛔ 按 name 定位 VDEC 节点：ge2d 启用后编号会顺延）
+    vdec_dev_node
+    if [ -n "$VDEC_DEV" ]; then
+        docker exec "$CTR" chmod 666 "$VDEC_DEV" 2>/dev/null \
+            && ok "容器内 $VDEC_DEV → 666" || warn "chmod $VDEC_DEV 失败"
+    else
+        warn "宿主未找到 meson-video-decoder 节点，跳过设备权限修补"
+    fi
     docker exec "$CTR" chmod 777 /data/local/tmp 2>/dev/null && ok "容器内 /data/local/tmp → 777"
 
-    # 预热参数
-    docker exec "$CTR" setprop debug.meson.prelude 2 2>/dev/null
-    docker exec "$CTR" setprop debug.meson.drop   1 2>/dev/null
-    docker exec "$CTR" setprop debug.meson.tail   1 2>/dev/null
-    ok "预热参数写回（prelude=2 drop=0 tail=1）"
+    # 预热参数：⚠ 刻意不写。全局属性会覆盖插件按格式的默认值（H.264 与 VP9 需要不同的
+    #   prelude），写了反而让某个格式退化。插件内部已有正确默认值。
+    info "预热参数：不写（交给插件按格式决定）"
 
     # OMX 插件
     # ★ 自愈必须尊重"用户已切软解"：否则每分钟把插件装回去，切换会被悄悄撤销
@@ -517,19 +726,25 @@ fix_host() {
         modprobe meson-vdec 2>/dev/null && sleep 2 && ok "modprobe meson-vdec 成功" \
             || warn "modprobe 失败（内核可能未编译该模块）"
     fi
-    if [ -e /dev/video0 ] && [ ! -f /etc/modules-load.d/meson-vdec.conf ]; then
+    vdec_dev_node
+    if [ -n "$VDEC_DEV" ] && [ ! -f /etc/modules-load.d/meson-vdec.conf ]; then
         echo "meson-vdec" > /etc/modules-load.d/meson-vdec.conf && ok "已设置开机加载" || warn "写入失败"
     fi
 
-    # 3. 设备权限
-    if [ -e /dev/video0 ]; then
-        chmod 666 /dev/video0 2>/dev/null && ok "宿主 /dev/video0 → 666"
+    # 3. 设备权限（⛔ 按 name 定位，别 chmod video0 —— 那可能是 ge2d）
+    if [ -n "$VDEC_DEV" ]; then
+        chmod 666 "$VDEC_DEV" 2>/dev/null && ok "宿主 $VDEC_DEV → 666"
     fi
 
     # 4. udev 规则
+    # ⛔⛔ 绝对不能写 KERNEL=="video*" 通配：那会把 video26（aml-vcodec-dec，雷区）
+    #     也设成 666 —— 容器一旦打开它整机内核死锁。必须按 name 白名单放行。
     local ud=/etc/udev/rules.d/99-oesp-gpu.rules
     cat > "$ud" <<'EOF'
-KERNEL=="video0", MODE="0666"
+# ⛔ 只放行这两个：meson-video-decoder（社区硬解）与 meson-ge2d（2D 加速）
+# ⛔ 绝不写 KERNEL=="video*" —— video26(aml-vcodec-dec) 是雷区，给权限 = 引狼入室
+KERNEL=="video*", ATTR{name}=="meson-video-decoder", MODE="0666"
+KERNEL=="video*", ATTR{name}=="meson-ge2d", MODE="0666"
 KERNEL=="renderD128", MODE="0666"
 KERNEL=="card0", MODE="0666"
 EOF
@@ -738,6 +953,7 @@ MODE="--report"
 DO_HOST=0
 DO_REBUILD=0
 DECODER_ARG=""
+ARG=""
 for a in "$@"; do
     case "$a" in
         --detect) MODE="--detect" ;;
@@ -747,7 +963,10 @@ for a in "$@"; do
         --rebuild) DO_REBUILD=1 ;;
         --decoder) MODE="--decoder" ;;
         --gpu-clients) MODE="--gpu-clients" ;;
-        soft|hard|status) DECODER_ARG="$a" ;;
+        --ge2d) MODE="--ge2d" ;;
+        --gpu-freq) MODE="--gpu-freq" ;;
+        soft|hard) DECODER_ARG="$a" ;;
+        status|selftest|fix|auto|500|666|800) ARG="$a" ;;
         --yes)    ;;
     esac
 done
@@ -853,11 +1072,27 @@ if [ "$MODE" = "--gpu-clients" ]; then
 fi
 
 if [ "$MODE" = "--decoder" ]; then
-    if [ -z "$DECODER_ARG" ] || [ "$DECODER_ARG" = "status" ]; then
+    if [ -z "$DECODER_ARG" ] || [ "$DECODER_ARG" = "status" ] || [ "$ARG" = "status" ]; then
         decoder_status
     else
         decoder_switch "$DECODER_ARG"
     fi
+    exit 0
+fi
+
+# ---- ge2d 2D 加速：status（只读）/ selftest（跑一次像素比对）/ fix（重载补丁模块，需 root）
+if [ "$MODE" = "--ge2d" ]; then
+    case "${ARG:-status}" in
+        selftest) ge2d_run_selftest 512 10 || echo '{"ok":false,"msg":"自检程序不可用（二进制缺失且无法现场编译）"}' ;;
+        fix)      ge2d_fix_json ;;
+        *)        ge2d_status_json ;;
+    esac
+    exit 0
+fi
+
+# ---- GPU 频率下限：status / auto / 500 / 666 / 800
+if [ "$MODE" = "--gpu-freq" ]; then
+    gpu_freq_json "${ARG:-status}"
     exit 0
 fi
 

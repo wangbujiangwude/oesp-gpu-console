@@ -36,7 +36,7 @@ try:
 except Exception:
     fcntl = None
 
-VERSION = "1.3.2"
+VERSION = "1.3.3"
 APP_NAME = "gpuconsole"
 
 APP_DEST = os.environ.get("TRIM_APPDEST", "/var/apps/gpuconsole/target")
@@ -670,6 +670,7 @@ def collect():
         "gpu_clients": gpu_clients(),
         "android": android_info(),
         "decoder": decoder_info(),
+        "ge2d": ge2d_info(),
         "can_root": can_root(),
         "euid": (os.geteuid() if hasattr(os, "geteuid") else -1),
     }
@@ -733,6 +734,88 @@ def decoder_switch(mode):
         return {"ok": False, "msg": "切换失败: %s" % str(e)[:200]}
     _dec_cache["ts"] = 0.0      # 让下次 status 立即重查
     return d
+
+
+# --------------------------------------------------------------------------- GE2D
+# Amlogic 2D 加速单元。⚠ G12B 上的判断不能只看"模块加载着"：
+# 主线驱动缺 canvas 寻址，在 G12A/B 上会【跑完却全零】（ioctl 全成功、中断照常响，
+# 目标缓冲区一个字节都没写）。所以"是否可用"必须靠逐像素自检，status 只报状态。
+_ge2d_cache = {"ts": 0.0, "data": None}
+GE2D_TTL = 15.0
+
+
+def _tail_json(txt):
+    """从脚本输出里取出最后一段 {...}（脚本可能先打印别的诊断行）。
+
+    ⚠ 不能只取 rfind('{')：若 JSON 内部有嵌套的转义 '{'（把另一段 JSON 塞进字段里
+       就会这样），截取出来的片段是坏的。这里从最外层开始、逐个 '{' 往左试。
+    """
+    starts = [i for i, ch in enumerate(txt) if ch == "{"]
+    for i in reversed(starts):
+        j = txt.rfind("}")
+        while j > i:
+            try:
+                return json.loads(txt[i:j + 1])
+            except Exception:
+                j = txt.rfind("}", 0, j)
+    return None
+
+
+def ge2d_info(force=False):
+    now = time.time()
+    if not force and _ge2d_cache["data"] and (now - _ge2d_cache["ts"]) < GE2D_TTL:
+        return _ge2d_cache["data"]
+    fx = fix_script()
+    d = {"ok": False, "loaded": 0, "module": "", "patched": 0, "dev": "",
+         "clk_mhz": -1, "irq": 0, "selftest_bin": 0, "scaling": False,
+         "yuv": False, "error": ""}
+    if not os.path.isfile(fx):
+        d["error"] = "修补脚本缺失"
+        _ge2d_cache.update(ts=now, data=d)
+        return d
+    try:
+        r = _run([fx, "--ge2d", "status"], 25)
+        j = _tail_json((r.stdout or b"").decode("utf-8", "replace"))
+        if j:
+            d.update(j)
+            d["ok"] = True
+        else:
+            d["error"] = "脚本未返回 JSON"
+    except Exception as e:
+        d["error"] = str(e)[:120]
+    _ge2d_cache.update(ts=now, data=d)
+    return d
+
+
+def ge2d_action(action):
+    """selftest = 真跑一次像素比对；fix = 重载 canvas 补丁模块（需 root）"""
+    fx = fix_script()
+    if not os.path.isfile(fx):
+        return {"ok": False, "msg": "修补脚本缺失"}
+    a = action if action in ("selftest", "fix") else "status"
+    try:
+        r = _run([fx, "--ge2d", a], 90)
+        j = _tail_json((r.stdout or b"").decode("utf-8", "replace"))
+        if j:
+            _ge2d_cache["ts"] = 0.0      # 动作后让状态立即重查
+            return j
+        return {"ok": False, "msg": ((r.stdout or b"").decode("utf-8", "replace") or "无输出")[:200]}
+    except Exception as e:
+        return {"ok": False, "msg": "执行失败: %s" % str(e)[:200]}
+
+
+def gpu_freq_set(mode):
+    """GPU 频率下限：status / auto / 500 / 666 / 800（写 devfreq min_freq，需 root）"""
+    fx = fix_script()
+    if not os.path.isfile(fx):
+        return {"ok": False, "msg": "修补脚本缺失"}
+    m = mode if mode in ("auto", "500", "666", "800") else "status"
+    try:
+        r = _run([fx, "--gpu-freq", m], 40)
+        j = _tail_json((r.stdout or b"").decode("utf-8", "replace"))
+        return j or {"ok": False, "msg": ((r.stdout or b"").decode("utf-8", "replace") or "无输出")[:200]}
+    except Exception as e:
+        return {"ok": False, "msg": "执行失败: %s" % str(e)[:200]}
 
 
 def api_history():
@@ -831,6 +914,22 @@ def handle_request(conn):
             d = decoder_switch(mode) if mode else decoder_info(force=True)
             send(conn, "200 OK", "application/json; charset=utf-8",
                  json.dumps(d, ensure_ascii=False).encode("utf-8"))
+        elif bare == "/api/ge2d":
+            # action=status（默认，走 15s 缓存）| selftest | fix
+            act = "status"
+            for k in ("selftest", "fix"):
+                if ("action=" + k) in target:
+                    act = k
+            d = ge2d_info(force=(act == "status")) if act == "status" else ge2d_action(act)
+            send(conn, "200 OK", "application/json; charset=utf-8",
+                 json.dumps(d, ensure_ascii=False).encode("utf-8"))
+        elif bare == "/api/gpu-freq":
+            m = "status"
+            for k in ("auto", "500", "666", "800"):
+                if ("set=" + k) in target:
+                    m = k
+            send(conn, "200 OK", "application/json; charset=utf-8",
+                 json.dumps(gpu_freq_set(m), ensure_ascii=False).encode("utf-8"))
         elif bare == "/api/android":
             send(conn, "200 OK", "application/json; charset=utf-8",
                  json.dumps(android_info(force=True), ensure_ascii=False).encode("utf-8"))
@@ -1143,6 +1242,13 @@ window.addEventListener('unhandledrejection', function(e){
     <div class="big" id="freq">–<span class="unit">MHz</span></div>
     <div class="bar"><i id="freqbar" style="width:0%"></i></div>
     <div style="font-size:11px;color:var(--dim);margin-top:6px" id="freqrange">–</div>
+    <div class="acts" style="margin-top:10px">
+      <button class="btn" data-freq="auto">默认下限</button>
+      <button class="btn" data-freq="500">≥500</button>
+      <button class="btn" data-freq="666">≥666</button>
+      <button class="btn" data-freq="800">满频 800</button>
+    </div>
+    <div style="font-size:11px;color:var(--dim);margin-top:6px" id="freqnote">频率下限：读取中…</div>
   </div>
   <div class="card">
     <h2>CMA 连续内存</h2>
@@ -1165,6 +1271,25 @@ window.addEventListener('unhandledrejection', function(e){
   <div class="card">
     <h2>硬件状态</h2>
     <table id="tbl"></table>
+  </div>
+</div>
+
+<div class="card" style="margin-bottom:16px">
+  <h2>2D 加速 GE2D（Amlogic 2D 图形单元）</h2>
+  <div class="rowflex">
+    <div class="big" id="ge2dState">–</div>
+    <div style="flex:1;font-size:12px;color:var(--dim)" id="ge2dInfo">读取中…</div>
+    <button class="btn btn-go"   id="btnGe2dTest">一键自检</button>
+    <button class="btn btn-warn" id="btnGe2dFix">重载补丁模块</button>
+  </div>
+  <div class="notice" id="ge2dMsg" style="display:none"></div>
+  <table id="ge2dTbl" style="margin-top:10px"></table>
+  <div style="font-size:11px;color:var(--dim);margin-top:10px;line-height:1.7">
+    ⚠ <b>能力边界</b>（驱动源码 Missing features 实锤）：<b>不支持缩放</b>、<b>不支持 YUV/NV12 输入</b>、<b>不做色彩空间转换</b> ——
+    只能做 RGB↔RGB 的搬运与格式转换，<b>不能</b>替掉 OMX 里的 NV12→RGBA（那条路走 NEON）。<br>
+    ⚠ <b>G12B 陷阱</b>：主线驱动按 AXG 的方式写 BADDR，而 G12 必须用 canvas 索引 —— 原版会
+    <b>跑完却全零</b>（ioctl 全成功、中断照常响，目标缓冲一个字节都没写）。所以这里不看返回码，
+    每次自检都真跑一次<b>逐像素比对</b>。不缩放时的价值是：把 CPU 从搬运里彻底解放出来。
   </div>
 </div>
 
@@ -1228,7 +1353,7 @@ window.addEventListener('unhandledrejection', function(e){
 
 <div class="warnbox" style="display:block;margin-top:12px">⚠️ <b>致命雷区警告</b>：本机的 <b>/dev/video26</b> 与 <b>/sys/class/vdec</b> 一旦被任何程序访问（哪怕只是 cat 读取），会立即造成整机内核死锁，只能物理断电恢复。本控制台仅做只读采集，已全程规避这两个路径；也请务必不要用其它工具或脚本去触碰它们。</div>
 
-<div class="foot">GPU 控制台 v1.3.1 · 默认只读监控，仅在你点击修补/切换按钮时才改配置 · 开发者与发布者：老汪不讲武德</div>
+<div class="foot">GPU 控制台 v1.3.3 · 默认只读监控，仅在你点击修补/切换按钮时才改配置 · 开发者与发布者：老汪不讲武德</div>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -1329,7 +1454,11 @@ async function load(){
     $('errbox').style.display = 'none';
     try{ draw(await gwFetch('api/history', 12000)); }catch(e){}
     // 体检要跑 docker 探测，比状态刷新慢得多，只在首屏做一次，之后手动或修补后触发
-    if (firstDetect){ firstDetect = false; detect(); }
+    if (firstDetect){
+      firstDetect = false;
+      detect();
+      freqLoad();          // GPU 频率下限（只查一次，改档位时再查）
+    }
     loading = false;
     return;
   }catch(e){
@@ -1405,6 +1534,7 @@ function render(d){
         : '<tr><td colspan="2" style="color:var(--dim)">当前没有容器在使用 GPU</td></tr>');
 
   renderGpuClients(d);
+  renderGe2d(d.ge2d || {});
   renderAndroid(d);
 
   const risky = cs.filter(c => c.privileged).map(c => c.name);
@@ -1485,6 +1615,108 @@ function renderGpuClients(d){
   $('gpucsub').textContent = '共 ' + gc.length + ' 个 GPU 客户端，常驻显存 ≈ ' + total
     + ' MB（已按「独占 + 共享峰值」去重估算）｜ 数据来自内核 DRM fdinfo，只读采集；'
     + 'panfrost 未提供引擎周期计数，真实利用率无法读取，此处用频率比代理';
+}
+
+// ---------- GE2D 2D 加速 ----------
+function renderGe2d(g){
+  g = g || {};
+  window.__ge2d = g;
+  const loaded = (g.loaded === 1 || g.loaded === true);
+  const st = $('ge2dState'), info = $('ge2dInfo'), tb = $('ge2dTbl');
+  if (g.error){
+    st.innerHTML = '未知<span class="unit">采集失败</span>';
+    info.textContent = g.error;
+    tb.innerHTML = '';
+    return;
+  }
+  if (!loaded){
+    st.innerHTML = '未启用<span class="unit">模块未加载</span>';
+    st.style.color = 'var(--yellow)';
+    info.textContent = '2D 加速不可用（不影响 3D 渲染与视频硬解）';
+    tb.innerHTML = '<tr><td>模块</td><td style="color:var(--dim)">ge2d_oesp 未加载</td></tr>';
+    return;
+  }
+  const good = (g.patched === 1 || g.patched === true);
+  st.innerHTML = (good ? '已启用' : '异常') +
+    '<span class="unit">' + (good ? 'canvas 补丁版' : '原版模块') + '</span>';
+  st.style.color = good ? 'var(--green)' : 'var(--red)';
+  info.textContent = (g.module || '?') + ' · ' + (g.dev || '无节点') +
+    ' · vapb ' + (g.clk_mhz >= 0 ? g.clk_mhz + ' MHz' : '未知');
+  const rows = [
+    ['模块', (g.module || '—') + (good
+        ? '<span class="tag t-ok">canvas 补丁</span>'
+        : '<span class="tag t-bad">原版（G12B 不出图）</span>')],
+    ['设备节点', g.dev || '<span class="tag t-bad">无</span>'],
+    ['时钟（vapb）', (g.clk_mhz >= 0 ? g.clk_mhz + ' MHz' : '未知') +
+        ((g.clk_mhz === 500) ? '<span class="tag t-ok">已切 vapb_1</span>'
+                             : '<span class="tag t-warn">低于 500MHz</span>')],
+    ['中断累计', g.irq],
+    ['自检程序', g.selftest_bin ? '就位<span class="tag t-ok">OK</span>'
+                                : '缺失<span class="tag t-warn">会现场编译</span>'],
+    ['缩放 / YUV / 色转', '<span class="tag t-warn">均不支持</span>']
+  ];
+  tb.innerHTML = rows.map(r => '<tr><td>' + r[0] + '</td><td>' + r[1] + '</td></tr>').join('');
+}
+async function ge2dRun(act){
+  const el = $('ge2dMsg');
+  el.style.display = 'block';
+  el.textContent = (act === 'fix')
+    ? '正在重载 canvas 补丁模块（500MHz）…'
+    : '正在自检：512×512 RGB24→XRGB32 跑 10 次并逐像素比对…';
+  $('btnGe2dTest').disabled = true; $('btnGe2dFix').disabled = true;
+  try{
+    const r = await gwFetch('api/ge2d?action=' + act, 60000);
+    if (act === 'selftest'){
+      if (r && (r.ok === true || r.ok === 1)){
+        const x = (r.cpu_soft_ms && r.cpu_ms) ? Math.round(r.cpu_soft_ms / Math.max(r.cpu_ms, 0.01)) : 0;
+        el.innerHTML = '✅ <b>自检通过</b>：' + r.w + '×' + r.h + ' ×' + r.repeat +
+          '，<b>逐像素与 CPU 参考一致</b>（mismatch 0 / ' + r.pixels + '，排布 ' + r.layout + '）' +
+          '<br>吞吐 <b>' + r.mpx_s + ' Mpx/s</b> ｜ 墙钟 ' + r.wall_ms + ' ms ｜ CPU ' + r.cpu_ms +
+          ' ms（同尺寸朴素软转 ' + r.cpu_soft_ms + ' ms' + (x ? '，省约 ' + x + '× CPU 时间' : '') + '）';
+      } else if (r && r.all_zero){
+        el.innerHTML = '❌ <b>输出全为零</b> —— canvas 寻址失效，补丁没生效（这是 G12B 经典假象：'
+          + 'ioctl 全成功、中断照常响，只是缓冲没被写）。请点「重载补丁模块」。';
+      } else {
+        el.innerHTML = '❌ 自检未通过：' + ((r && r.msg) || JSON.stringify(r).slice(0, 160));
+      }
+    } else {
+      el.innerHTML = (r && (r.ok === 1 || r.ok === true))
+        ? ('✅ 已重载：' + (r.module || '?') + ' · ' + (r.dev || '—') + ' · ' + (r.clk_mhz || '?') + ' MHz')
+        : ('❌ ' + ((r && r.msg) || JSON.stringify(r).slice(0, 160)));
+      try{ const d = await gwFetch('api/status', 12000); renderGe2d(d.ge2d || {}); }catch(e){}
+    }
+  }catch(e){
+    el.textContent = '失败：' + ((e && e.message) ? e.message : e);
+  }
+  $('btnGe2dTest').disabled = false; $('btnGe2dFix').disabled = false;
+}
+async function freqLoad(){
+  try{
+    const r = await gwFetch('api/gpu-freq', 20000);
+    if (!r || r.ok === false){ $('freqnote').textContent = '频率下限：不可用（' + ((r && r.msg) || '?') + '）'; return; }
+    window.__freq = r;
+    freqRender();
+  }catch(e){ $('freqnote').textContent = '频率下限：读取失败'; }
+}
+function freqRender(){
+  const r = window.__freq;
+  if (!r) return;
+  let t = '下限 ' + r.min_mhz + ' MHz ｜ 上限 ' + r.max_mhz + ' MHz ｜ 策略 ' + r.governor;
+  if (r.pinned_low){
+    t += '　⚠ 当前被钉在最低档 ' + r.cur_mhz + ' MHz（simple_ondemand 没感知到负载），可点上方按钮抬下限';
+    $('freqnote').style.color = 'var(--yellow)';
+  } else {
+    $('freqnote').style.color = 'var(--dim)';
+  }
+  $('freqnote').textContent = t;
+}
+async function freqSet(m){
+  $('freqnote').textContent = '正在设置为 ' + m + ' …';
+  try{
+    const r = await gwFetch('api/gpu-freq?set=' + m, 30000);
+    if (r && r.ok){ window.__freq = r; freqRender(); }
+    else $('freqnote').textContent = '设置失败：' + ((r && r.msg) || '?');
+  }catch(e){ $('freqnote').textContent = '设置失败：' + e; }
 }
 
 // ---------- 安卓容器 GPU 详情 ----------
@@ -1571,6 +1803,12 @@ function renderDetect(d){
   } else {
     np.style.display = 'none';
     $('btnFixH').disabled = false; $('btnFixR').disabled = false;
+  }
+  // 重载 ge2d 模块要 root（insmod），没授权就禁用，避免点了半天没反应
+  const gf = $('btnGe2dFix');
+  if (gf){
+    gf.disabled = !d.can_root;
+    gf.title = d.can_root ? '' : '需要 root：先在 SSH 里执行一次授权命令';
   }
 }
 
@@ -1676,6 +1914,11 @@ $('btnFixH').onclick   = () => repair('host');
 $('btnFixR').onclick   = () => repair('rebuild');
 $('btnDecSoft').onclick = () => decSet('soft');
 $('btnDecHard').onclick = () => decSet('hard');
+$('btnGe2dTest').onclick = () => ge2dRun('selftest');
+$('btnGe2dFix').onclick  = () => ge2dRun('fix');
+document.querySelectorAll('[data-freq]').forEach(function(b){
+  b.onclick = () => freqSet(b.getAttribute('data-freq'));
+});
 
 load();
 setInterval(load, 2000);
