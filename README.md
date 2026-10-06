@@ -15,7 +15,7 @@
 | 内容 | 路径 | 说明 |
 |---|---|---|
 | **GPU 控制台源码** | `gpu-console/` | 飞牛 fnOS 原生应用（FPK）完整工程，Python 3 单文件后端 + 前端 + 修补脚本 |
-| **FPK 安装包** | `release/gpuconsole_1.3.1.fpk` | 可直接安装到飞牛设备的成品包（最新版；`release/` 下保留历史版本） |
+| **FPK 安装包** | `release/gpuconsole_1.3.3.fpk` | 可直接安装到飞牛设备的成品包（最新版；`release/` 下保留历史版本） |
 | **部分测试数据** | `docs/` | 17 篇真机实测报告，**已脱敏** |
 
 ---
@@ -115,7 +115,7 @@ cd oesp-gpu-console/gpu-console && bash build_fpk.sh
 # → ../gpuconsole_<版本>.fpk
 
 # 2) 在飞牛设备上安装
-appcenter-cli install-fpk gpuconsole_1.3.1.fpk -v 1
+appcenter-cli install-fpk gpuconsole_1.3.3.fpk -v 1
 # 注意：同 appname 不会升级，需先 uninstall 再 install
 #       ⛔ uninstall 子命令不接受 -v 参数（写了只打印 Usage，看起来安装成功实则未替换文件）
 
