@@ -230,6 +230,148 @@ info() { echo "  [ .. ] $*"; }
 sec()  { echo; echo "── $* ──"; }
 
 # ==============================================================================
+#  AVE 硬编码（HCODEC H.264 编码器，2026-10-08 完整打通）
+# ------------------------------------------------------------------------------
+#  根因链：registers.ko 的 __this_module.init 被剥（module_init 注册删掉）⇒ codec-io
+#          平台驱动从未 probe ⇒ 总线 base / codec bus 表全 NULL ⇒ 未修复时发起编码
+#          = 上电序列打空炮后访问未上电块 = 总线级硬挂（看门狗 20s 复位）。
+#  修复：  /root/vdec/ave/regfix/regfix_ensure.sh（root cron 每分钟幂等自愈）
+#          —— oesp_regfix.ko 运行时复刻 probe + 注册 G12B ops 表，免改 DT、免重启。
+#  ⛔⛔ 自检安全门：codec-io 修复未生效时【绝不能】发起任何编码请求。
+#  能力边界（实测）：上限 1920x1080（更大优雅失败）；720p≈35fps、1080p≈16-31fps，
+#          零 CPU 占用；⛔ 码率参数无效（设备库 rc 函数指针表被清零 + 内核 encoder.ko
+#          无视下发 QP ⇒ 输出恒 ~2.2bpp 近无损）。
+AVE_VPLIB="${GPU_FIX_VPLIB:-/root/vdec/ave/libvpcodec.so}"
+AVE_REGFIX_DIR="/root/vdec/ave/regfix"
+AVE_REGFIX_SH="$AVE_REGFIX_DIR/regfix_ensure.sh"
+AVE_BIN_DIR="/usr/local/lib/oesp-gpu/ave"
+AVE_BIN="$AVE_BIN_DIR/avetest10"
+AVE_ENC_LOADED=0; AVE_DEV=""; AVE_REGFIX=0; AVE_CRON=0; AVE_REGMOD=0
+
+ave_probe() {
+    AVE_ENC_LOADED=0; AVE_DEV=""; AVE_REGFIX=0; AVE_CRON=0; AVE_REGMOD=0
+    mod_loaded encoder   && AVE_ENC_LOADED=1
+    mod_loaded registers && AVE_REGMOD=1
+    [ -e /dev/amvenc_avc ] && AVE_DEV=/dev/amvenc_avc
+    # ⚠ 不能写 `dmesg | grep -q ... && AVE_REGFIX=1`：脚本开了 pipefail，dmesg 输出远大于
+    #   管道缓冲，grep -q 命中即退出会把 dmesg 杀成 SIGPIPE(141)，管道整体返回 141 而非 0，
+    #   永远判 false（实测踩坑）。grep -c 会读完整个输入，无 SIGPIPE —— 与 H9 同款写法。
+    local _rfx=0
+    _rfx=$(dmesg 2>/dev/null | grep -c "OESP_REGFIX: FIX OK")
+    [ "${_rfx:-0}" -gt 0 ] 2>/dev/null && AVE_REGFIX=1
+    # crontab 在 sudo 环境可能不在 PATH，且是 per-user 的 —— 同时查落盘文件（同 S1 的教训）
+    if { command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -q regfix_ensure; } \
+       || grep -rq regfix_ensure /var/spool/cron/crontabs/ /etc/cron.d/ 2>/dev/null; then
+        AVE_CRON=1
+    fi
+}
+
+ave_status_json() {
+    ave_probe
+    local lib=0 bin=0 ensure=0
+    [ -f "$AVE_VPLIB" ] && lib=1
+    [ -x "$AVE_BIN" ] && bin=1
+    [ -f "$AVE_REGFIX_SH" ] && ensure=1
+    echo "{"
+    echo " \"enc_loaded\":$AVE_ENC_LOADED,\"dev\":\"$AVE_DEV\",\"regmod\":$AVE_REGMOD,"
+    echo " \"regfix\":$AVE_REGFIX,\"cron\":$AVE_CRON,\"ensure_sh\":$ensure,"
+    echo " \"lib\":$lib,\"bin\":$bin,\"vplib\":\"$AVE_VPLIB\""
+    echo "}"
+}
+
+ave_selftest_json() {   # 720p × 10 帧真编码 + ffmpeg 可解性校验（带安全门）
+    if [ ! -f "$AVE_VPLIB" ]; then
+        echo "{\"ok\":false,\"msg\":\"编码库缺失：$AVE_VPLIB（AVE 测试资产未部署到 /root/vdec/ave）\"}"
+        return 1
+    fi
+    ave_probe
+    # ⛔⛔ 安全门：codec-io 未修复时发起编码 = 总线级硬挂。先尝试触发自愈，仍不生效则拒绝。
+    if [ "$AVE_REGFIX" != "1" ]; then
+        if [ -f "$AVE_REGFIX_SH" ]; then
+            bash "$AVE_REGFIX_SH" >/dev/null 2>&1
+            sleep 1
+            ave_probe
+        fi
+        if [ "$AVE_REGFIX" != "1" ]; then
+            echo "{\"ok\":false,\"msg\":\"⛔ codec-io 修复未生效，已拒绝编码自检（未修复时发起编码会整机硬挂）。请先点「一键修复」，或部署 $AVE_REGFIX_SH\"}"
+            return 1
+        fi
+    fi
+    # 自检程序：缺则现场编译（同 ge2d 模式）。
+    # ⚠ 源码有两个可能位置：sudoers 固化目录（fixsync 只同步 .sh，源码可能没跟上）
+    #   与应用包内 scripts/（install-fpk 一定有）—— 依次找。
+    if [ ! -x "$AVE_BIN" ]; then
+        local src=""
+        for c in "$SELF_DIR/avetest10.c" /var/apps/gpuconsole/target/scripts/avetest10.c; do
+            [ -f "$c" ] && src="$c" && break
+        done
+        if [ -n "$src" ]; then
+            mkdir -p "$AVE_BIN_DIR" 2>/dev/null
+            cp "$src" "$AVE_BIN_DIR/avetest10.c" 2>/dev/null
+            if have gcc; then
+                gcc -O2 -o "$AVE_BIN" "$AVE_BIN_DIR/avetest10.c" -ldl 2>>"$LOGDIR/ave_build.log" \
+                    && chmod 755 "$AVE_BIN" 2>/dev/null
+            fi
+        fi
+    fi
+    [ -x "$AVE_BIN" ] || { echo "{\"ok\":false,\"msg\":\"自检程序不可用（二进制缺失且无法现场编译）\"}"; return 1; }
+    # 跑 720p × 10 帧（NOSYNC=1 纯计时；PERF 行含 ok/avg_ms/enc_fps/bytes）
+    local out frames=0 okf=0 avg_ms=0 enc_fps=0 bytes=0
+    out=$(NOSYNC=1 BR=2000000 FPS=25 timeout 90 "$AVE_BIN" encode_n 10 1280 720 2>&1 | grep -E "^PERF")
+    if [ -n "$out" ]; then
+        frames=$(printf '%s' "$out"  | sed -n 's/.*[^_0-9]frames=\([0-9]*\).*/\1/p')
+        okf=$(printf '%s' "$out"    | sed -n 's/.*[^_0-9]frames=[0-9]* ok=\([0-9]*\).*/\1/p')
+        avg_ms=$(printf '%s' "$out" | sed -n 's/.*avg_ms=\([0-9.]*\).*/\1/p')
+        enc_fps=$(printf '%s' "$out"| sed -n 's/.*enc_fps=\([0-9.]*\).*/\1/p')
+        bytes=$(printf '%s' "$out"  | sed -n 's/.*[^_0-9]bytes=\([0-9]*\).*/\1/p')
+    fi
+    [ -n "$frames" ] || frames=0
+    [ -n "$okf" ] || okf=0
+    [ -n "$avg_ms" ] || avg_ms=0
+    [ -n "$enc_fps" ] || enc_fps=0
+    [ -n "$bytes" ] || bytes=0
+    # 码流可解性（ffmpeg 解 /root/vdec/ave/dp/out10.h264，统计帧数）
+    local dec=-1 deco=0
+    if have ffmpeg && [ -f /root/vdec/ave/dp/out10.h264 ]; then
+        dec=$(ffmpeg -i /root/vdec/ave/dp/out10.h264 -f null - 2>&1 \
+              | tr '\r' '\n' | sed -n 's/.*frame=\s*\([0-9]*\).*/\1/p' | tail -1)
+        [ -n "$dec" ] || dec=-1
+        [ "$dec" = "$okf" ] && [ "$okf" -gt 0 ] 2>/dev/null && deco=1
+    fi
+    local ok=0
+    [ "$frames" -gt 0 ] 2>/dev/null && [ "$okf" = "$frames" ] 2>/dev/null && ok=1
+    echo "{\"ok\":$ok,\"w\":1280,\"h\":720,\"frames\":$frames,\"ok_frames\":$okf,"
+    echo " \"avg_ms\":$avg_ms,\"enc_fps\":$enc_fps,\"bytes\":$bytes,\"dec_frames\":$dec,\"decode_ok\":$deco}"
+}
+
+ave_fix_json() {   # 触发 regfix 自愈（幂等）+ 补挂 cron；需要 root
+    if [ "$IS_ROOT" != "1" ]; then
+        echo "{\"ok\":false,\"msg\":\"需要 root：请用 sudo 执行\"}"; return 1
+    fi
+    if [ ! -f "$AVE_REGFIX_SH" ]; then
+        echo "{\"ok\":false,\"msg\":\"修复脚本缺失：$AVE_REGFIX_SH（oesp_regfix 部署物未安装）\"}"; return 1
+    fi
+    local rc=0
+    FORCE=1 bash "$AVE_REGFIX_SH" >/dev/null 2>&1 || rc=$?
+    sleep 1
+    ave_probe
+    # cron 缺则补（备份先行，断电截断教训）
+    local cron_added=0
+    if [ "$AVE_CRON" != "1" ]; then
+        crontab -l > "$AVE_REGFIX_DIR/crontab.bak.$(date +%Y%m%d-%H%M%S)" 2>/dev/null
+        sync
+        (crontab -l 2>/dev/null; echo '* * * * * /root/vdec/ave/regfix/regfix_ensure.sh >/dev/null 2>&1') | crontab -
+        cron_added=1
+        ave_probe
+    fi
+    local last=""
+    [ -f "$AVE_REGFIX_DIR/ensure.log" ] && last=$(tail -1 "$AVE_REGFIX_DIR/ensure.log" | tr -d '"\\')
+    echo "{\"ok\":$AVE_REGFIX,\"ensure_rc\":$rc,\"regfix\":$AVE_REGFIX,\"cron\":$AVE_CRON,"
+    echo " \"cron_added\":$cron_added,\"last\":\"$last\"}"
+}
+
+
+# ==============================================================================
 #  检测
 # ==============================================================================
 detect() {
@@ -406,6 +548,29 @@ detect() {
                 add H14 host warn "ge2d 自检" "自检程序不可用（二进制缺失且无法现场编译）" "在 SSH 里 gcc 编译 ge2d_selftest.c" 1
             fi
         fi
+    fi
+
+    # ---- A1/A2/A3 AVE 硬编码（HCODEC）----
+    # 2026-10-08 打通：encoder 模块 + codec-io 修复（regfix）+ cron 自愈三者齐备 = 硬编可用。
+    # ⛔ codec-io 未修复时发起编码会总线级硬挂（整机复位），regfix 状态是硬性门槛。
+    ave_probe
+    if [ "$AVE_ENC_LOADED" = "1" ]; then
+        add A1 host ok "AVE 硬编码模块" "encoder 已加载（HCODEC H.264，节点 $AVE_DEV）"
+    else
+        add A1 host warn "AVE 硬编码模块" "encoder 未加载（硬编不可用，不影响 3D/硬解/ge2d）" "modprobe encoder" 1
+    fi
+    if [ "$AVE_REGFIX" = "1" ]; then
+        add A2 host ok "AVE codec-io 修复" "已生效（OESP_REGFIX: FIX OK）"
+    elif [ -f "$AVE_REGFIX_SH" ]; then
+        add A2 host fail "AVE codec-io 修复" \
+            "未生效 —— registers.ko 的 init 被剥，此状态下发起编码会整机硬挂" "运行 regfix_ensure.sh" 1
+    else
+        add A2 host warn "AVE codec-io 修复" "修复组件未部署（$AVE_REGFIX_SH 缺失）" 1
+    fi
+    if [ "$AVE_CRON" = "1" ]; then
+        add A3 host ok "AVE 修复自愈" "cron 已挂载（每分钟幂等）"
+    else
+        add A3 host warn "AVE 修复自愈" "未挂载，重启后硬编修复丢失" "crontab 添加 regfix_ensure" 1
     fi
 
     # ---------- 容器 ----------
@@ -965,6 +1130,7 @@ for a in "$@"; do
         --gpu-clients) MODE="--gpu-clients" ;;
         --ge2d) MODE="--ge2d" ;;
         --gpu-freq) MODE="--gpu-freq" ;;
+        --ave) MODE="--ave" ;;
         soft|hard) DECODER_ARG="$a" ;;
         status|selftest|fix|auto|500|666|800) ARG="$a" ;;
         --yes)    ;;
@@ -1093,6 +1259,16 @@ fi
 # ---- GPU 频率下限：status / auto / 500 / 666 / 800
 if [ "$MODE" = "--gpu-freq" ]; then
     gpu_freq_json "${ARG:-status}"
+    exit 0
+fi
+
+# ---- AVE 硬编码：status（只读）/ selftest（720p×10 帧真编码，带安全门）/ fix（regfix 自愈）
+if [ "$MODE" = "--ave" ]; then
+    case "${ARG:-status}" in
+        selftest) ave_selftest_json ;;
+        fix)      ave_fix_json ;;
+        *)        ave_status_json ;;
+    esac
     exit 0
 fi
 

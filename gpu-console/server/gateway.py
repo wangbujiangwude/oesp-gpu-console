@@ -36,7 +36,7 @@ try:
 except Exception:
     fcntl = None
 
-VERSION = "1.3.3"
+VERSION = "1.3.4"
 APP_NAME = "gpuconsole"
 
 APP_DEST = os.environ.get("TRIM_APPDEST", "/var/apps/gpuconsole/target")
@@ -671,6 +671,7 @@ def collect():
         "android": android_info(),
         "decoder": decoder_info(),
         "ge2d": ge2d_info(),
+        "ave": ave_info(),
         "can_root": can_root(),
         "euid": (os.geteuid() if hasattr(os, "geteuid") else -1),
     }
@@ -818,6 +819,55 @@ def gpu_freq_set(mode):
         return {"ok": False, "msg": "执行失败: %s" % str(e)[:200]}
 
 
+# --------------------------------------------------------------------------- AVE
+_ave_cache = {"ts": 0.0, "data": None}
+AVE_TTL = 15.0
+
+
+def ave_info(force=False):
+    """AVE 硬编码状态：encoder 模块 / codec-io 修复（regfix）/ cron 自愈 三位一体。"""
+    now = time.time()
+    if not force and _ave_cache["data"] and (now - _ave_cache["ts"]) < AVE_TTL:
+        return _ave_cache["data"]
+    fx = fix_script()
+    d = {"ok": False, "enc_loaded": 0, "dev": "", "regfix": 0, "cron": 0,
+         "lib": 0, "bin": 0, "error": ""}
+    if not os.path.isfile(fx):
+        d["error"] = "修补脚本缺失"
+        _ave_cache.update(ts=now, data=d)
+        return d
+    try:
+        r = _run([fx, "--ave", "status"], 25)
+        j = _tail_json((r.stdout or b"").decode("utf-8", "replace"))
+        if j:
+            d.update(j)
+            d["ok"] = True
+        else:
+            d["error"] = "脚本未返回 JSON"
+    except Exception as e:
+        d["error"] = str(e)[:120]
+    _ave_cache.update(ts=now, data=d)
+    return d
+
+
+def ave_action(action):
+    """selftest = 720p×10 帧真编码（脚本内置安全门：codec-io 未修复会拒绝，防整机硬挂）；
+       fix = 触发 regfix 自愈 + 补挂 cron（需 root）"""
+    fx = fix_script()
+    if not os.path.isfile(fx):
+        return {"ok": False, "msg": "修补脚本缺失"}
+    a = action if action in ("selftest", "fix") else "status"
+    try:
+        r = _run([fx, "--ave", a], 150)
+        j = _tail_json((r.stdout or b"").decode("utf-8", "replace"))
+        if j:
+            _ave_cache["ts"] = 0.0      # 动作后让状态立即重查
+            return j
+        return {"ok": False, "msg": ((r.stdout or b"").decode("utf-8", "replace") or "无输出")[:200]}
+    except Exception as e:
+        return {"ok": False, "msg": "执行失败: %s" % str(e)[:200]}
+
+
 def api_history():
     with _lock:
         pts = [{
@@ -921,6 +971,15 @@ def handle_request(conn):
                 if ("action=" + k) in target:
                     act = k
             d = ge2d_info(force=(act == "status")) if act == "status" else ge2d_action(act)
+            send(conn, "200 OK", "application/json; charset=utf-8",
+                 json.dumps(d, ensure_ascii=False).encode("utf-8"))
+        elif bare == "/api/ave":
+            # action=status（默认，走 15s 缓存）| selftest | fix
+            act = "status"
+            for k in ("selftest", "fix"):
+                if ("action=" + k) in target:
+                    act = k
+            d = ave_info(force=True) if act == "status" else ave_action(act)
             send(conn, "200 OK", "application/json; charset=utf-8",
                  json.dumps(d, ensure_ascii=False).encode("utf-8"))
         elif bare == "/api/gpu-freq":
@@ -1293,6 +1352,27 @@ window.addEventListener('unhandledrejection', function(e){
   </div>
 </div>
 
+<div class="card" style="margin-bottom:16px">
+  <h2>AVE 硬编码（HCODEC H.264 编码器）</h2>
+  <div class="rowflex">
+    <div class="big" id="aveState">–</div>
+    <div style="flex:1;font-size:12px;color:var(--dim)" id="aveInfo">读取中…</div>
+    <button class="btn btn-go"   id="btnAveTest">一键自检</button>
+    <button class="btn btn-warn" id="btnAveFix">一键修复</button>
+  </div>
+  <div class="notice" id="aveMsg" style="display:none"></div>
+  <table id="aveTbl" style="margin-top:10px"></table>
+  <div style="font-size:11px;color:var(--dim);margin-top:10px;line-height:1.7">
+    ⚠ <b>背景</b>：registers.ko 的 module_init 注册被剥 → codec-io 总线表全 NULL，
+    <b>未修复时发起任何编码请求都会总线级硬挂（整机复位）</b>。修复 = 运行时补 probe + 注册 G12B
+    ops 表（regfix，cron 每分钟幂等自愈）。自检带安全门：未修复会自动拒绝执行。<br>
+    ⚠ <b>能力边界</b>（实测）：上限 <b>1080p</b>（更大分辨率优雅失败）；720p≈35fps、
+    1080p≈16-31fps，<b>零 CPU 占用</b>（这是它对 x264 软编 45fps 的真正优势）；
+    <b>码率参数无效</b> —— 设备库 rc 函数指针表被清零 + 内核 encoder.ko 无视下发 QP，
+    输出恒 ~2.2bpp 近无损。串流前需先解决码率，零 CPU 转存/归档可直接用。
+  </div>
+</div>
+
 <details class="fold" id="gpucFold">
   <summary>GPU 客户端（按进程归因）<span class="foldbrief" id="gpucBrief">读取中…</span></summary>
   <div class="foldbody">
@@ -1535,6 +1615,7 @@ function render(d){
 
   renderGpuClients(d);
   renderGe2d(d.ge2d || {});
+  renderAve(d.ave || {});
   renderAndroid(d);
 
   const risky = cs.filter(c => c.privileged).map(c => c.name);
@@ -1690,6 +1771,82 @@ async function ge2dRun(act){
   }
   $('btnGe2dTest').disabled = false; $('btnGe2dFix').disabled = false;
 }
+// ---------- AVE 硬编码（HCODEC）----------
+function renderAve(a){
+  a = a || {};
+  window.__ave = a;
+  const st = $('aveState'), info = $('aveInfo'), tb = $('aveTbl');
+  if (a.error){
+    st.innerHTML = '未知<span class="unit">采集失败</span>';
+    st.style.color = 'var(--dim)';
+    info.textContent = a.error;
+    tb.innerHTML = '';
+    return;
+  }
+  const enc = (a.enc_loaded === 1 || a.enc_loaded === true);
+  const regfix = (a.regfix === 1 || a.regfix === true);
+  if (!enc){
+    st.innerHTML = '未启用<span class="unit">encoder 未加载</span>';
+    st.style.color = 'var(--yellow)';
+    info.textContent = 'AVE 硬编码不可用（不影响 3D 渲染 / 视频硬解 / ge2d）';
+    tb.innerHTML = '<tr><td>模块</td><td style="color:var(--dim)">encoder 未加载</td></tr>';
+    return;
+  }
+  st.innerHTML = regfix ? '可用<span class="unit">codec-io 已修复</span>'
+                        : '危险<span class="unit">codec-io 未修复</span>';
+  st.style.color = regfix ? 'var(--green)' : 'var(--red)';
+  info.textContent = (a.dev || '无节点') + (regfix
+    ? ' · 修复生效 · 可安全编码'
+    : ' · ⛔ 此时发起编码会整机硬挂，先点「一键修复」');
+  const rows = [
+    ['编码器模块', 'encoder.ko<span class="tag t-ok">已加载</span>'],
+    ['设备节点', a.dev || '<span class="tag t-bad">无</span>'],
+    ['codec-io 修复（regfix）', regfix
+        ? '已生效<span class="tag t-ok">FIX OK</span>'
+        : '<span class="tag t-bad">未生效 — 禁止编码</span>'],
+    ['修复自愈（cron）', (a.cron === 1 || a.cron === true)
+        ? '已挂载<span class="tag t-ok">每分钟幂等</span>'
+        : '<span class="tag t-warn">未挂载，重启即失效</span>'],
+    ['编码库 / 自检程序', (a.lib ? 'libvpcodec ✓' : '缺失') + ' / '
+        + (a.bin ? 'avetest10 ✓' : '缺失（自检时现场编译）')],
+    ['能力', 'H.264 ｜ 上限 1080p ｜ 720p≈35fps ｜ 1080p≈16-31fps ｜ 零 CPU'],
+    ['码率控制', '<span class="tag t-warn">无效（输出近无损 ~2.2bpp，串流前需解决）</span>']
+  ];
+  tb.innerHTML = rows.map(r => '<tr><td>' + r[0] + '</td><td>' + r[1] + '</td></tr>').join('');
+}
+async function aveRun(act){
+  const el = $('aveMsg');
+  el.style.display = 'block';
+  el.textContent = (act === 'fix')
+    ? '正在触发 codec-io 修复自愈（regfix ensure + 补挂 cron）…'
+    : '正在自检：1280×720 ×10 帧真编码（带安全门：codec-io 未修复会自动拒绝）…';
+  $('btnAveTest').disabled = true; $('btnAveFix').disabled = true;
+  try{
+    const r = await gwFetch('api/ave?action=' + act, 150000);
+    if (act === 'selftest'){
+      if (r && (r.ok === 1 || r.ok === true)){
+        el.innerHTML = '✅ <b>硬编码自检通过</b>：' + r.w + '×' + r.h + ' ×' + r.frames
+          + ' 帧全部成功，ffmpeg 软解 ' + r.dec_frames + ' 帧'
+          + (r.decode_ok ? '<b>全部可解</b>' : '') + '<br>吞吐 <b>' + r.enc_fps
+          + ' fps</b>（均帧 ' + r.avg_ms + ' ms）｜ 输出 '
+          + (r.bytes / 1048576).toFixed(2) + ' MB（码率不受控，近无损）';
+      } else {
+        el.innerHTML = '❌ ' + ((r && r.msg) || JSON.stringify(r).slice(0, 200));
+      }
+    } else {
+      el.innerHTML = (r && (r.ok === 1 || r.ok === true))
+        ? ('✅ 修复自愈已执行：regfix=' + (r.regfix ? '生效' : '未生效')
+           + ' · cron=' + (r.cron ? '已挂载' : '未挂载')
+           + (r.cron_added ? '（本次补挂）' : '')
+           + (r.last ? '<br>ensure.log: ' + r.last : ''))
+        : ('❌ ' + ((r && r.msg) || JSON.stringify(r).slice(0, 200)));
+      try{ const d = await gwFetch('api/status', 12000); renderAve(d.ave || {}); }catch(e){}
+    }
+  }catch(e){
+    el.textContent = '失败：' + ((e && e.message) ? e.message : e);
+  }
+  $('btnAveTest').disabled = false; $('btnAveFix').disabled = false;
+}
 async function freqLoad(){
   try{
     const r = await gwFetch('api/gpu-freq', 20000);
@@ -1810,6 +1967,12 @@ function renderDetect(d){
     gf.disabled = !d.can_root;
     gf.title = d.can_root ? '' : '需要 root：先在 SSH 里执行一次授权命令';
   }
+  // AVE 一键修复同样要走 root 脚本（regfix ensure + crontab）
+  const af = $('btnAveFix');
+  if (af){
+    af.disabled = !d.can_root;
+    af.title = d.can_root ? '' : '需要 root：先在 SSH 里执行一次授权命令';
+  }
 }
 
 // ---------- 修补 ----------
@@ -1916,6 +2079,8 @@ $('btnDecSoft').onclick = () => decSet('soft');
 $('btnDecHard').onclick = () => decSet('hard');
 $('btnGe2dTest').onclick = () => ge2dRun('selftest');
 $('btnGe2dFix').onclick  = () => ge2dRun('fix');
+$('btnAveTest').onclick = () => aveRun('selftest');
+$('btnAveFix').onclick  = () => aveRun('fix');
 document.querySelectorAll('[data-freq]').forEach(function(b){
   b.onclick = () => freqSet(b.getAttribute('data-freq'));
 });
