@@ -1,0 +1,5 @@
+obj-m += oesp_regfix.o
+K := /lib/modules/$(shell uname -r)/build
+all:
+	rm -f oesp_regfix.ko
+	make -C $(K) M=$(CURDIR) modules

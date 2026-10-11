@@ -6,8 +6,11 @@
 # 第三方代码保留其原始许可，详见 NOTICE 文件。
 
 # ==============================================================================
-#  OESP GPU 一键修补脚本  v2.0
+#  OESP GPU 一键修补脚本  v2.1（控制台 v1.3.5）
 #  ---------------------------------------------------------------------------
+#  v2.1：宿主部署物（ge2d_oesp.ko / oesp_regfix.ko / regfix_ensure.sh / ge2d_selftest）
+#        随包发布于 scripts/deploy/，修复动作前自动补齐到目标位置（vermagic 校验先行）——
+#        全新安装的机器上「重载补丁模块 / AVE 一键修复」开箱即用。
 #  与 v1 的区别：v1 是"照单全修"，v2 是【先检测再精准修补】——
 #  控制台调用 --detect 拿到结构化问题清单，用户点哪个修哪个，
 #  已经正常的项不会被动到（v1 每次都重写 udev/blacklist，噪音大）。
@@ -170,8 +173,9 @@ ge2d_fix_json() {   # 需要 root
     if [ "$IS_ROOT" != "1" ]; then
         echo "{\"ok\":false,\"msg\":\"需要 root：请用 sudo 执行\"}"; return 1
     fi
+    deploy_deps   # 补丁模块缺失时先从包内补齐（v1.3.5）
     if [ ! -f "$GE2D_KO" ]; then
-        echo "{\"ok\":false,\"msg\":\"补丁模块缺失：$GE2D_KO\"}"; return 1
+        echo "{\"ok\":false,\"msg\":\"补丁模块缺失：$GE2D_KO（包内 deploy/ 也未找到或内核版本不匹配）\"}"; return 1
     fi
     # ⚠ 速率检查必须放在"是否已加载"之外：已加载但仍是 250MHz 时也要纠正
     if [ "$(cat /sys/module/ge2d_oesp/parameters/ge2d_clk_rate 2>/dev/null)" != "500000000" ]; then
@@ -248,6 +252,68 @@ AVE_BIN_DIR="/usr/local/lib/oesp-gpu/ave"
 AVE_BIN="$AVE_BIN_DIR/avetest10"
 AVE_ENC_LOADED=0; AVE_DEV=""; AVE_REGFIX=0; AVE_CRON=0; AVE_REGMOD=0
 
+# ---- 包内部署物自动补齐（v1.3.5） -------------------------------------------
+# ge2d_oesp.ko / oesp_regfix.ko / regfix_ensure.sh 这些宿主部署物随应用包发布
+# （scripts/deploy/）。目标位置缺失时，修复动作前自动从包内复制到位 ——
+# 全新安装的机器上「重载补丁模块 / 一键修复」不再报"部署物未安装"。
+# .ko 是按 fnOS 同版本内核（6.18.18.c997-trim）预编译的；部署前做 vermagic
+# 校验，内核不匹配就不部署（宁可保持"缺失"报错，也不 insmod 一个不兼容模块）。
+DEPLOY_DIR="$SELF_DIR/deploy"
+
+ko_vermagic_ok() {  # ko_vermagic_ok <file>  当前内核能加载该 ko 吗（vermagic 前缀比对）
+    local f="$1" vm=""
+    [ -f "$f" ] || return 1
+    if have modinfo; then
+        vm=$(modinfo -F vermagic "$f" 2>/dev/null)
+    fi
+    # ⚠ 不用 strings（fnOS 上不保证有）：vermagic 明文躺在 .modinfo 段，grep -a 一定能抽到
+    [ -z "$vm" ] && vm=$(grep -aom1 'vermagic=[^ ]*' "$f" 2>/dev/null | sed 's/^vermagic=//')
+    [ -n "$vm" ] || return 1
+    case "$vm" in
+        "$(uname -r)"*|*"$(uname -r)"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+deploy_deps() {    # 从包内 deploy/ 补齐缺失的宿主部署物（需 root；幂等）
+    [ "$IS_ROOT" = "1" ] || return 0
+    [ -d "$DEPLOY_DIR" ] || return 0
+    # -- ge2d 补丁模块 + 自检程序 --
+    if [ ! -f "$GE2D_KO" ] && [ -f "$DEPLOY_DIR/ge2d_oesp.ko" ]; then
+        if ko_vermagic_ok "$DEPLOY_DIR/ge2d_oesp.ko"; then
+            mkdir -p "$(dirname "$GE2D_KO")" 2>/dev/null
+            cp "$DEPLOY_DIR/ge2d_oesp.ko" "$GE2D_KO" 2>/dev/null && chmod 644 "$GE2D_KO" && sync
+        fi
+    fi
+    if [ ! -x "$GE2D_BIN" ] && [ -f "$DEPLOY_DIR/ge2d_selftest" ]; then
+        mkdir -p "$(dirname "$GE2D_BIN")" 2>/dev/null
+        cp "$DEPLOY_DIR/ge2d_selftest" "$GE2D_BIN" 2>/dev/null && chmod 755 "$GE2D_BIN" && sync
+    fi
+    # -- AVE regfix 自愈（脚本 + ko + 源码/Makefile 兜底）--
+    if [ -f "$DEPLOY_DIR/regfix_ensure.sh" ]; then
+        local need=0
+        [ ! -f "$AVE_REGFIX_SH" ] && need=1
+        [ ! -f "$AVE_REGFIX_DIR/oesp_regfix.ko" ] && need=1
+        if [ "$need" = "1" ]; then
+            mkdir -p "$AVE_REGFIX_DIR" 2>/dev/null
+            if [ ! -f "$AVE_REGFIX_DIR/oesp_regfix.ko" ] \
+               && [ -f "$DEPLOY_DIR/oesp_regfix.ko" ] \
+               && ko_vermagic_ok "$DEPLOY_DIR/oesp_regfix.ko"; then
+                cp "$DEPLOY_DIR/oesp_regfix.ko" "$AVE_REGFIX_DIR/" 2>/dev/null
+                cp "$DEPLOY_DIR/oesp_regfix.c"  "$AVE_REGFIX_DIR/" 2>/dev/null
+                [ -f "$DEPLOY_DIR/Makefile.regfix" ] \
+                    && cp "$DEPLOY_DIR/Makefile.regfix" "$AVE_REGFIX_DIR/Makefile" 2>/dev/null
+            fi
+            if [ ! -f "$AVE_REGFIX_SH" ]; then
+                cp "$DEPLOY_DIR/regfix_ensure.sh" "$AVE_REGFIX_SH" 2>/dev/null \
+                    && chmod 755 "$AVE_REGFIX_SH"
+            fi
+            sync
+        fi
+    fi
+    return 0
+}
+
 ave_probe() {
     AVE_ENC_LOADED=0; AVE_DEV=""; AVE_REGFIX=0; AVE_CRON=0; AVE_REGMOD=0
     mod_loaded encoder   && AVE_ENC_LOADED=1
@@ -286,6 +352,7 @@ ave_selftest_json() {   # 720p × 10 帧真编码 + ffmpeg 可解性校验（带
     fi
     ave_probe
     # ⛔⛔ 安全门：codec-io 未修复时发起编码 = 总线级硬挂。先尝试触发自愈，仍不生效则拒绝。
+    deploy_deps   # 自愈脚本缺失时先从包内补齐（v1.3.5）
     if [ "$AVE_REGFIX" != "1" ]; then
         if [ -f "$AVE_REGFIX_SH" ]; then
             bash "$AVE_REGFIX_SH" >/dev/null 2>&1
@@ -348,8 +415,9 @@ ave_fix_json() {   # 触发 regfix 自愈（幂等）+ 补挂 cron；需要 root
     if [ "$IS_ROOT" != "1" ]; then
         echo "{\"ok\":false,\"msg\":\"需要 root：请用 sudo 执行\"}"; return 1
     fi
+    deploy_deps   # 自愈脚本/ko 缺失时先从包内补齐（v1.3.5）
     if [ ! -f "$AVE_REGFIX_SH" ]; then
-        echo "{\"ok\":false,\"msg\":\"修复脚本缺失：$AVE_REGFIX_SH（oesp_regfix 部署物未安装）\"}"; return 1
+        echo "{\"ok\":false,\"msg\":\"修复脚本缺失：$AVE_REGFIX_SH（包内 deploy/ 也未找到，oesp_regfix 部署物无法补齐）\"}"; return 1
     fi
     local rc=0
     FORCE=1 bash "$AVE_REGFIX_SH" >/dev/null 2>&1 || rc=$?

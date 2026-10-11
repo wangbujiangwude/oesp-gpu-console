@@ -34,3 +34,8 @@ wizard/*    text eol=lf
 *.PNG       binary
 *.png       binary
 *.tgz       binary
+gpu-console/scripts/deploy/Makefile.* eol=lf
+gpu-console/scripts/deploy/*.sh eol=lf
+gpu-console/scripts/deploy/*.c eol=lf
+gpu-console/scripts/deploy/*.ko binary
+gpu-console/scripts/deploy/ge2d_selftest binary

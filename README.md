@@ -15,7 +15,7 @@
 | 内容 | 路径 | 说明 |
 |---|---|---|
 | **GPU 控制台源码** | `gpu-console/` | 飞牛 fnOS 原生应用（FPK）完整工程，Python 3 单文件后端 + 前端 + 修补脚本 |
-| **FPK 安装包** | `release/gpuconsole_1.3.4.fpk` | 可直接安装到飞牛设备的成品包（最新版；`release/` 下保留历史版本） |
+| **FPK 安装包** | `release/gpuconsole_1.3.5.fpk` | 可直接安装到飞牛设备的成品包（最新版；`release/` 下保留历史版本） |
 | **部分测试数据** | `docs/` | 19 篇真机实测报告，**已脱敏** |
 
 ---
@@ -104,7 +104,8 @@ NV12 要搬两次、V4L2 syscall 开销重、最后还要软件做 YUV→RGB，
 ### 2.4 硬件编码（AVE / HCODEC）性能实测 ✅
 
 飞牛内核里带一套 **Amlogic AVE H.264 硬件编码器**（`encoder.ko` + `libvpcodec`，设备节点
-`/dev/amvenc_avc`）。v1.3.4 起控制台把它做成了**可观测 + 可一键修复**的面板。
+`/dev/amvenc_avc`）。v1.3.4 起控制台把它做成了**可观测 + 可一键修复**的面板；
+v1.3.5 起修复所需部署物随包内置，全新安装开箱即用。
 
 实测（Amlogic S922X / G12B，6 核，`avetest10` 纯编码计时）：
 
@@ -156,7 +157,7 @@ cd oesp-gpu-console/gpu-console && bash build_fpk.sh
 # → ../gpuconsole_<版本>.fpk
 
 # 2) 在飞牛设备上安装
-appcenter-cli install-fpk gpuconsole_1.3.4.fpk -v 1
+appcenter-cli install-fpk gpuconsole_1.3.5.fpk -v 1
 # 注意：同 appname 不会升级，需先 uninstall 再 install
 #       ⛔ uninstall 子命令不接受 -v 参数（写了只打印 Usage，看起来安装成功实则未替换文件）
 
