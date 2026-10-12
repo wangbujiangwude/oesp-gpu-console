@@ -37,7 +37,7 @@ try:
 except Exception:
     fcntl = None
 
-VERSION = "1.3.7"
+VERSION = "1.3.8"
 APP_NAME = "gpuconsole"
 
 APP_DEST = os.environ.get("TRIM_APPDEST", "/var/apps/gpuconsole/target")
@@ -1965,7 +1965,7 @@ function renderGe2d(g){
     ['模块', (g.module || '—') + (good
         ? '<span class="tag t-ok">canvas 补丁</span>'
         : '<span class="tag t-bad">原版（G12B 不出图）</span>')],
-    ['设备节点', g.dev || '<span class="tag t-bad">无</span>'],
+    ['设备节点', g.dev || '<span class="tag t-bad">无 —— 模块在但未绑定：设备树缺 ge2d 节点（系统更新会还原 DTB，需重新注入并重启）</span>'],
     ['时钟（vapb）', (g.clk_mhz >= 0 ? g.clk_mhz + ' MHz' : '未知') +
         ((g.clk_mhz === 500) ? '<span class="tag t-ok">已切 vapb_1</span>'
                              : '<span class="tag t-warn">低于 500MHz</span>')],
@@ -2000,7 +2000,8 @@ async function ge2dRun(act){
       }
     } else {
       el.innerHTML = (r && (r.ok === 1 || r.ok === true))
-        ? ('✅ 已重载：' + (r.module || '?') + ' · ' + (r.dev || '—') + ' · ' + (r.clk_mhz || '?') + ' MHz')
+        ? ('✅ 已重载：' + (r.module || '?') + ' · ' + (r.dev || '—') + ' · ' + (r.clk_mhz || '?') + ' MHz'
+           + (r.note ? '<br>⚠️ ' + r.note : ''))
         : ('❌ ' + ((r && r.msg) || JSON.stringify(r).slice(0, 160)));
       try{ const d = await gwFetch('api/status', 12000); renderGe2d(d.ge2d || {}); }catch(e){}
     }

@@ -199,8 +199,13 @@ ge2d_fix_json() {   # 需要 root
     fi
     [ -z "$st_mpx" ] && st_mpx=0
     [ -z "$st_mm" ] && st_mm=-1
+    # v1.3.8 诚实性检查：模块在但没绑定到设备节点 = DTB 缺 ge2d 节点（系统更新会还原设备树）
+    local note=""
+    if [ "$GE2D_LOADED" = "1" ] && [ -z "$GE2D_DEV" ]; then
+        note="模块已加载但未绑定设备节点：设备树缺 ge2d 节点（系统更新可能还原了 DTB）。需重新注入 ge2d 节点并重启，2D 自检才能通过"
+    fi
     echo "{\"ok\":$GE2D_LOADED,\"module\":\"$GE2D_MOD\",\"dev\":\"$GE2D_DEV\",\"clk_mhz\":$GE2D_CLK,"
-    echo " \"selftest_ok\":$st_ok,\"selftest_zero\":$st_zero,\"mismatch\":$st_mm,\"mpx_s\":$st_mpx}"
+    echo " \"selftest_ok\":$st_ok,\"selftest_zero\":$st_zero,\"mismatch\":$st_mm,\"mpx_s\":$st_mpx,\"note\":\"$note\"}"
 }
 
 # ---- GPU（Mali-G52）频率下限 -------------------------------------------------
@@ -277,7 +282,7 @@ deploy_missing_reason() {  # deploy_missing_reason <deploy内文件名>  输出�
     fi
     local vm
     vm=$(grep -aom1 'vermagic=[^ ]*' "$DEPLOY_DIR/$f" 2>/dev/null | sed 's/^vermagic=//')
-    echo "包内部署物在，但本机内核 $(uname -r) 与其 vermagic（${vm:-未知}）不匹配，拒绝加载"
+    echo "包内部署物在，但本机内核 $(uname -r) 与其 vermagic（${vm:-未知}）不匹配，拒绝加载${BUILD_NOTE:+（$BUILD_NOTE）}"
 }
 
 ko_vermagic_ok() {  # ko_vermagic_ok <file>  当前内核能加载该 ko 吗（vermagic 前缀比对）
@@ -295,14 +300,42 @@ ko_vermagic_ok() {  # ko_vermagic_ok <file>  当前内核能加载该 ko 吗（v
     esac
 }
 
-deploy_deps() {    # 从包内 deploy/ 补齐缺失的宿主部署物（需 root；幂等）
+deploy_build_one() {    # deploy_build_one <ko名> <Makefile名> —— 包内 ko 与当前内核 vermagic 失配时，用设备内核头现场重编
+    local ko="$1" mk="$2" src="${ko%.ko}.c"
+    BUILD_NOTE=""
+    command -v make >/dev/null 2>&1 || { BUILD_NOTE="设备无 make"; return 1; }
+    local kb="/lib/modules/$(uname -r)/build"
+    [ -d "$kb" ] || { BUILD_NOTE="无内核头（/lib/modules/$(uname -r)/build 不存在），飞牛更新后首次需装 linux-headers"; return 1; }
+    local t="/tmp/oesp-rebuild-$$"
+    rm -rf "$t"; mkdir -p "$t"
+    cp "$DEPLOY_DIR/$src" "$t/" 2>/dev/null || { BUILD_NOTE="包内缺源码 $src"; return 1; }
+    cp "$DEPLOY_DIR/$mk" "$t/Makefile" 2>/dev/null || { BUILD_NOTE="包内缺 $mk"; return 1; }
+    # ge2d 需要 ge2d-regs.h（v1.3.8 起随包）；没有就先试编（老版本源码可能自带路径）
+    [ -f "$DEPLOY_DIR/ge2d-regs.h" ] && cp "$DEPLOY_DIR/ge2d-regs.h" "$t/"
+    ( cd "$t" && make >/dev/null 2>&1 )
+    if [ -f "$t/$ko" ] && ko_vermagic_ok "$t/$ko"; then
+        cp "$t/$ko" "$DEPLOY_DIR/$ko" 2>/dev/null && BUILD_NOTE="已按内核 $(uname -r) 现场重编" \
+            && { rm -rf "$t"; return 0; }
+    fi
+    BUILD_NOTE="现场重编失败（make 输出见 /tmp/oesp-rebuild-last.log）"
+    ( cd "$t" && make ) >/tmp/oesp-rebuild-last.log 2>&1
+    rm -rf "$t"; return 1
+}
+
+deploy_deps() {    # 从包内 deploy/ 补齐缺失的宿主部署物（需 root；幂等；vermagic 失配时现场重编）
     [ "$IS_ROOT" = "1" ] || return 0
     [ -d "$DEPLOY_DIR" ] || return 0
     # -- ge2d 补丁模块 + 自检程序 --
-    if [ ! -f "$GE2D_KO" ] && [ -f "$DEPLOY_DIR/ge2d_oesp.ko" ]; then
-        if ko_vermagic_ok "$DEPLOY_DIR/ge2d_oesp.ko"; then
-            mkdir -p "$(dirname "$GE2D_KO")" 2>/dev/null
-            cp "$DEPLOY_DIR/ge2d_oesp.ko" "$GE2D_KO" 2>/dev/null && chmod 644 "$GE2D_KO" && sync
+    # 系统更新场景：目标 ko 还在但 vermagic 已失配 → 同样要补（先现场重编再落位）
+    if [ -f "$DEPLOY_DIR/ge2d_oesp.ko" ]; then
+        if [ ! -f "$GE2D_KO" ] || ! ko_vermagic_ok "$GE2D_KO"; then
+            if ! ko_vermagic_ok "$DEPLOY_DIR/ge2d_oesp.ko"; then
+                deploy_build_one ge2d_oesp.ko Makefile.ge2d
+            fi
+            if ko_vermagic_ok "$DEPLOY_DIR/ge2d_oesp.ko"; then
+                mkdir -p "$(dirname "$GE2D_KO")" 2>/dev/null
+                cp "$DEPLOY_DIR/ge2d_oesp.ko" "$GE2D_KO" 2>/dev/null && chmod 644 "$GE2D_KO" && sync
+            fi
         fi
     fi
     if [ ! -x "$GE2D_BIN" ] && [ -f "$DEPLOY_DIR/ge2d_selftest" ]; then
@@ -313,16 +346,25 @@ deploy_deps() {    # 从包内 deploy/ 补齐缺失的宿主部署物（需 root
     if [ -f "$DEPLOY_DIR/regfix_ensure.sh" ]; then
         local need=0
         [ ! -f "$AVE_REGFIX_SH" ] && need=1
-        [ ! -f "$AVE_REGFIX_DIR/oesp_regfix.ko" ] && need=1
+        if [ ! -f "$AVE_REGFIX_DIR/oesp_regfix.ko" ] \
+           || ! ko_vermagic_ok "$AVE_REGFIX_DIR/oesp_regfix.ko"; then
+            need=1
+        fi
         if [ "$need" = "1" ]; then
             mkdir -p "$AVE_REGFIX_DIR" 2>/dev/null
             if [ ! -f "$AVE_REGFIX_DIR/oesp_regfix.ko" ] \
-               && [ -f "$DEPLOY_DIR/oesp_regfix.ko" ] \
-               && ko_vermagic_ok "$DEPLOY_DIR/oesp_regfix.ko"; then
-                cp "$DEPLOY_DIR/oesp_regfix.ko" "$AVE_REGFIX_DIR/" 2>/dev/null
-                cp "$DEPLOY_DIR/oesp_regfix.c"  "$AVE_REGFIX_DIR/" 2>/dev/null
-                [ -f "$DEPLOY_DIR/Makefile.regfix" ] \
-                    && cp "$DEPLOY_DIR/Makefile.regfix" "$AVE_REGFIX_DIR/Makefile" 2>/dev/null
+               || ! ko_vermagic_ok "$AVE_REGFIX_DIR/oesp_regfix.ko"; then
+                if [ ! -f "$DEPLOY_DIR/oesp_regfix.ko" ] \
+                   || ! ko_vermagic_ok "$DEPLOY_DIR/oesp_regfix.ko"; then
+                    deploy_build_one oesp_regfix.ko Makefile.regfix
+                fi
+                if [ -f "$DEPLOY_DIR/oesp_regfix.ko" ] \
+                   && ko_vermagic_ok "$DEPLOY_DIR/oesp_regfix.ko"; then
+                    cp "$DEPLOY_DIR/oesp_regfix.ko" "$AVE_REGFIX_DIR/" 2>/dev/null
+                    cp "$DEPLOY_DIR/oesp_regfix.c"  "$AVE_REGFIX_DIR/" 2>/dev/null
+                    [ -f "$DEPLOY_DIR/Makefile.regfix" ] \
+                        && cp "$DEPLOY_DIR/Makefile.regfix" "$AVE_REGFIX_DIR/Makefile" 2>/dev/null
+                fi
             fi
             if [ ! -f "$AVE_REGFIX_SH" ]; then
                 cp "$DEPLOY_DIR/regfix_ensure.sh" "$AVE_REGFIX_SH" 2>/dev/null \
