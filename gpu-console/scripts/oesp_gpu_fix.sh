@@ -175,7 +175,7 @@ ge2d_fix_json() {   # 需要 root
     fi
     deploy_deps   # 补丁模块缺失时先从包内补齐（v1.3.5）
     if [ ! -f "$GE2D_KO" ]; then
-        echo "{\"ok\":false,\"msg\":\"补丁模块缺失：$GE2D_KO（包内 deploy/ 也未找到或内核版本不匹配）\"}"; return 1
+        echo "{\"ok\":false,\"msg\":\"补丁模块缺失：$GE2D_KO（$(deploy_missing_reason ge2d_oesp.ko)）\"}"; return 1
     fi
     # ⚠ 速率检查必须放在"是否已加载"之外：已加载但仍是 250MHz 时也要纠正
     if [ "$(cat /sys/module/ge2d_oesp/parameters/ge2d_clk_rate 2>/dev/null)" != "500000000" ]; then
@@ -259,6 +259,26 @@ AVE_ENC_LOADED=0; AVE_DEV=""; AVE_REGFIX=0; AVE_CRON=0; AVE_REGMOD=0
 # .ko 是按 fnOS 同版本内核（6.18.18.c997-trim）预编译的；部署前做 vermagic
 # 校验，内核不匹配就不部署（宁可保持"缺失"报错，也不 insmod 一个不兼容模块）。
 DEPLOY_DIR="$SELF_DIR/deploy"
+# ⚠ 兜底：授权后跑的是固化副本（/usr/local/lib/oesp-gpu/oesp_gpu_fix.sh），
+#   旧版 grant_root.sh / 一键授权只固化了脚本本体、没带 deploy/ —— 那时从
+#   应用安装目录取件（应用目录可被应用用户写，但运行到这里必然已经过授权，
+#   且 docker 组用户本就等同 root，不构成新增提权面）。
+[ -d "$DEPLOY_DIR" ] || DEPLOY_DIR="/var/apps/gpuconsole/target/scripts/deploy"
+
+deploy_missing_reason() {  # deploy_missing_reason <deploy内文件名>  输出诊断（不含双引号，供 JSON 拼接）
+    local f="$1"
+    if [ ! -d "$DEPLOY_DIR" ]; then
+        echo "包内 deploy/ 未找到（找过 $SELF_DIR/deploy 与 /var/apps/gpuconsole/target/scripts/deploy）"
+        return
+    fi
+    if [ ! -f "$DEPLOY_DIR/$f" ]; then
+        echo "包内 deploy/ 缺 $f（DEPLOY_DIR=$DEPLOY_DIR）"
+        return
+    fi
+    local vm
+    vm=$(grep -aom1 'vermagic=[^ ]*' "$DEPLOY_DIR/$f" 2>/dev/null | sed 's/^vermagic=//')
+    echo "包内部署物在，但本机内核 $(uname -r) 与其 vermagic（${vm:-未知}）不匹配，拒绝加载"
+}
 
 ko_vermagic_ok() {  # ko_vermagic_ok <file>  当前内核能加载该 ko 吗（vermagic 前缀比对）
     local f="$1" vm=""
@@ -417,7 +437,7 @@ ave_fix_json() {   # 触发 regfix 自愈（幂等）+ 补挂 cron；需要 root
     fi
     deploy_deps   # 自愈脚本/ko 缺失时先从包内补齐（v1.3.5）
     if [ ! -f "$AVE_REGFIX_SH" ]; then
-        echo "{\"ok\":false,\"msg\":\"修复脚本缺失：$AVE_REGFIX_SH（包内 deploy/ 也未找到，oesp_regfix 部署物无法补齐）\"}"; return 1
+        echo "{\"ok\":false,\"msg\":\"修复脚本缺失：$AVE_REGFIX_SH（$(deploy_missing_reason regfix_ensure.sh)）\"}"; return 1
     fi
     local rc=0
     FORCE=1 bash "$AVE_REGFIX_SH" >/dev/null 2>&1 || rc=$?

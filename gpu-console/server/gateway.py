@@ -37,7 +37,7 @@ try:
 except Exception:
     fcntl = None
 
-VERSION = "1.3.6"
+VERSION = "1.3.7"
 APP_NAME = "gpuconsole"
 
 APP_DEST = os.environ.get("TRIM_APPDEST", "/var/apps/gpuconsole/target")
@@ -681,11 +681,18 @@ def _grant_job():
                if os.path.isfile(os.path.join(real_dest, "scripts", f))]
         cp_res = " ".join("cp -f %s /host/usr/local/lib/oesp-gpu/;" % ("/host" + real_dest + "/scripts/" + f)
                           for f in res)
+        # deploy/（ge2d/regfix 宿主部署物）随授权一并固化：修补脚本跑在 SEC_DIR 时
+        # deploy_deps 从 $SELF_DIR/deploy 取件，不带过去全新机器会报"包内 deploy/ 也未找到"
+        deploy_src = "/host" + real_dest + "/scripts/deploy"
+        cp_deploy = ("if [ -d {d} ]; then mkdir -p /host/usr/local/lib/oesp-gpu/deploy; "
+                     "cp -f {d}/* /host/usr/local/lib/oesp-gpu/deploy/ 2>/dev/null || true; fi; "
+                     ).format(d=deploy_src)
         inner = (
             "set -e; "
             "mkdir -p /host/usr/local/lib/oesp-gpu /host/etc/sudoers.d; "
             "cp -f {src} /host/usr/local/lib/oesp-gpu/oesp_gpu_fix.sh; "
             "{cp_res}"
+            "{cp_deploy}"
             "chown -R 0:0 /host/usr/local/lib/oesp-gpu; "
             "chmod 755 /host/usr/local/lib/oesp-gpu /host/usr/local/lib/oesp-gpu/oesp_gpu_fix.sh; "
             "printf '%s\\n' '# fnOS app gpuconsole: only the fixed fix script is allowed. Revoke: sudo rm -f /etc/sudoers.d/gpuconsole-fix /usr/local/lib/oesp-gpu/oesp_gpu_fix.sh' > /host/etc/sudoers.d/gpuconsole-tmp; "
@@ -698,7 +705,7 @@ def _grant_job():
             "if [ \"$VC\" = failed ]; then rm -f /host/etc/sudoers.d/gpuconsole-tmp; echo VCHECK=failed; exit 3; fi; "
             "mv -f /host/etc/sudoers.d/gpuconsole-tmp /host/etc/sudoers.d/gpuconsole-fix; "
             "echo VCHECK=$VC; echo GRANT_OK"
-        ).format(src=c_src, cp_res=cp_res,
+        ).format(src=c_src, cp_res=cp_res, cp_deploy=cp_deploy,
                  rule=app_user + " ALL=(root) NOPASSWD: /usr/local/lib/oesp-gpu/oesp_gpu_fix.sh")
         cmd = ["docker", "run", "--rm", "--network", "none", "-v", "/:/host",
                "--entrypoint", "/bin/sh", img, "-c", inner]
@@ -1488,6 +1495,8 @@ window.addEventListener('unhandledrejection', function(e){
 </script>
 <div class="warnbox" id="errbox" style="display:none"></div>
 <div class="foot" id="diag" style="text-align:left;margin-top:6px;display:none"></div>
+<!-- root 授权引导：放在页面最顶部（用户要求），授权成功后随 can_root 自动消失 -->
+<div class="notice" id="nopriv" style="display:none;margin-bottom:14px"></div>
 <noscript><div class="warnbox" style="display:block">⚠️ 浏览器没有执行本页脚本（JavaScript 被禁用或被安全策略拦截），所以一直停在“加载中”。请允许本应用页面执行脚本后重新打开。</div></noscript>
 
 <div class="grid">
@@ -1598,7 +1607,6 @@ window.addEventListener('unhandledrejection', function(e){
     </div>
     <button class="btn" id="btnDetect">重新检测</button>
   </div>
-  <div class="notice" id="nopriv" style="display:none"></div>
   <table class="iss" id="issues"></table>
   <div class="acts">
     <button class="btn btn-go"   id="btnFixC">① 修补容器层（无需 root）</button>

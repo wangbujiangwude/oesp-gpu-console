@@ -51,6 +51,12 @@ SDIR="$(dirname "$SRC")"
 for f in libstagefrighthw32.so vdec_test3.c media_codecs.xml; do
     [ -f "$SDIR/$f" ] && cp -f "$SDIR/$f" "$SEC_DIR/$f"
 done
+# deploy/（ge2d/regfix 宿主部署物）一并固化：修补脚本跑在 SEC_DIR 时，
+# deploy_deps 从 $SELF_DIR/deploy 取件 —— 不带过去全新机器会报"包内 deploy/ 也未找到"
+if [ -d "$SDIR/deploy" ]; then
+    mkdir -p "$SEC_DIR/deploy"
+    cp -f "$SDIR/deploy/"* "$SEC_DIR/deploy/" 2>/dev/null
+fi
 chown -R root:root "$SEC_DIR"
 chmod 755 "$SEC_DIR"
 chmod 755 "$SEC_SH"
