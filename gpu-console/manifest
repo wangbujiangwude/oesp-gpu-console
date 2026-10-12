@@ -12,4 +12,4 @@ desktop_uidir              = ui
 desktop_applaunchname      = gpuconsole.Application
 checkport                  = false
 disable_authorization_path = true
-checksum                   = cb11436ee6ef1eb1f695e3cdc2956002
+checksum                   = 3680e77d8a674a8f7ce96c09a3f41d33
