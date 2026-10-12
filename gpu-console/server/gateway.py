@@ -28,6 +28,7 @@ import time
 import socket
 import signal
 import shutil
+import re
 import threading
 import subprocess
 
@@ -36,7 +37,7 @@ try:
 except Exception:
     fcntl = None
 
-VERSION = "1.3.4"
+VERSION = "1.3.6"
 APP_NAME = "gpuconsole"
 
 APP_DEST = os.environ.get("TRIM_APPDEST", "/var/apps/gpuconsole/target")
@@ -498,24 +499,37 @@ _repair = {"running": False, "level": "", "log": "", "rc": None, "started": 0.0,
            "finished": 0.0}
 
 
-def can_root():
+_canroot_cache = {"ts": 0.0, "v": False}
+
+
+def can_root(force=False):
     """当前进程能否以 root 执行【修补脚本】。
 
     ⚠ 不能只测 `sudo -n true`：sudoers 里只放行了特定脚本，`sudo -n true` 必然失败，
       那样会误判成"无 root"而永久禁用按钮。必须针对目标脚本探测（sudo -l <cmd>）。
+    ⚠ 2026-10-12：本函数在 /api/status 的 2 秒采样里也被调用（collect），
+      每次都 spawn 一个 sudo 进程既慢又给 sudo 压力；个别系统上 sudo 因 PAM/审计
+      日志可达数秒。加 30 秒缓存，授权动作完成后用 force=True 立即失效重查。
     """
+    now = time.time()
+    if not force and now - _canroot_cache["ts"] < 30.0:
+        return _canroot_cache["v"]
+    v = False
     try:
         if os.geteuid() == 0:
-            return True
+            v = True
     except Exception:
         pass
-    try:
-        tgt = fix_script()
-        r = subprocess.run(["sudo", "-n", "-l", tgt], capture_output=True, timeout=8)
-        out = (r.stdout or b"").decode("utf-8", "replace")
-        return r.returncode == 0 and tgt in out
-    except Exception:
-        return False
+    if not v:
+        try:
+            tgt = fix_script()
+            r = subprocess.run(["sudo", "-n", "-l", tgt], capture_output=True, timeout=8)
+            out = (r.stdout or b"").decode("utf-8", "replace")
+            v = r.returncode == 0 and tgt in out
+        except Exception:
+            v = False
+    _canroot_cache.update(ts=now, v=v)
+    return v
 
 
 def _run(cmd, timeout):
@@ -552,6 +566,187 @@ def run_detect():
         return json.loads(out.strip().splitlines()[-1])
     except Exception:
         return {"error": "检测输出解析失败", "raw": out[:500]}
+
+
+# ---------------------------------------------------------------------------
+# 体检异步化（2026-10-12）
+# 根因：旧实现 /api/detect 同步等脚本跑完（最长 150s），请求要穿过飞牛 nginx 网关，
+#   网关侧超时/连接重置会让浏览器直接抛 "Failed to fetch"（实测：修补完成后自动
+#   复检那一次必失败）。改为「后台线程跑 + 前端轮询取结果」，HTTP 请求本身毫秒级返回。
+_detect_state = {"running": False, "result": None, "ts": 0.0, "started": 0.0}
+_DETECT_STALE = 240.0     # 线程僵死保险：超过该时长视为卡死，允许重新启动
+
+
+def _detect_fill(d):
+    """给体检结果补上授权相关信息（与授权/按钮状态有关，每次都要最新）"""
+    d["can_root"] = can_root()
+    d["fix_script"] = fix_script()
+    d["granted"] = os.path.isfile(FIX_SH_SECURE)
+    d["grant_cmd"] = "sudo bash %s" % GRANT_SH
+    return d
+
+
+def detect_start():
+    """确保体检在后台跑；返回当前状态快照（含上次结果）"""
+    now = time.time()
+    if _detect_state["running"] and now - _detect_state["started"] > _DETECT_STALE:
+        log("体检线程超过 %ds 未返回，判定僵死，允许重启" % int(_DETECT_STALE))
+        _detect_state["running"] = False
+    if not _detect_state["running"]:
+        _detect_state.update(running=True, started=now)
+        can_root(force=True)          # 先刷新授权缓存，体检结果里的 can_root 才可信
+
+        def _job():
+            try:
+                d = run_detect()
+            except Exception as e:     # 理论上进不来，兜底
+                d = {"error": "检测异常: %s" % e}
+            _detect_fill(d)
+            _detect_state.update(running=False, result=d, ts=time.time())
+            log("后台体检完成: %s" % ("error" if d.get("error") else "ok"))
+
+        threading.Thread(target=_job, daemon=True).start()
+    return detect_status()
+
+
+def detect_status():
+    return {
+        "running": _detect_state["running"],
+        "elapsed": round(time.time() - _detect_state["started"], 1)
+                   if _detect_state["running"] else 0,
+        "age": round(time.time() - _detect_state["ts"], 1)
+               if _detect_state["result"] else None,
+        "result": _detect_state["result"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# 一键授权（2026-10-12）：免 SSH 完成 grant_root.sh 同等操作
+# 原理：本应用已在 docker 组（config/privilege groupname=docker），docker 命令可用；
+#   用一个一次性容器把宿主根目录挂进来（-v /:/host），以 root 身份：
+#     ① 把修补脚本从应用目录【复制】到 root 拥有的 /usr/local/lib/oesp-gpu/
+#     ② 写入仅放行该脚本的 sudoers 规则（visudo 可用则先校验）
+#   落点与 grant_root.sh 完全一致，等效于用户在 SSH 里手动执行它——只是不需要 SSH。
+# 安全边界（与 grant_root.sh 相同的两条）：
+#   · sudoers 只放行【固化后的那一个脚本】，不放行 shell/任意命令
+#   · 应用目录里 777 可改的原始脚本【永远不被授权】，授权的是 root 目录的副本
+# 前端调用前必须 confirm（明示"等效于把本应用提升为 root 管理者"）。
+_grant_state = {"running": False, "result": None, "started": 0.0}
+_USER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,31}$")
+
+
+def _docker_image():
+    """挑一个本地已有、可当工具用的镜像（不联网拉取）"""
+    imgs = sh("docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null").split()
+    imgs = [i for i in imgs if i and ":<none>" not in i and "none" not in i.split(":")[-1]]
+    for pre in ("busybox", "alpine", "debian", "ubuntu"):
+        for i in imgs:
+            if i.split(":")[0].endswith(pre):
+                return i
+    return imgs[0] if imgs else ""
+
+
+def _grant_job():
+    """后台执行授权。结果字段：ok / msg / via / vcheck / log"""
+    r = {"ok": False, "msg": "", "via": "", "vcheck": "", "log": ""}
+    try:
+        if can_root(force=True):
+            r.update(ok=True, via="already", msg="已具备 root 执行权限，无需授权")
+            _grant_state.update(running=False, result=r, finished=time.time())
+            return
+        real_dest = os.path.realpath(APP_DEST)
+        src_script = os.path.join(real_dest, "scripts", "oesp_gpu_fix.sh")
+        if not os.path.isfile(src_script):
+            r["msg"] = "找不到修补脚本: %s" % src_script
+            _grant_state.update(running=False, result=r, finished=time.time())
+            return
+        # 应用运行用户：以应用目录属主为准；容器内写 sudoers 时要做严格校验（防注入）
+        import pwd
+        try:
+            app_user = pwd.getpwuid(os.stat(real_dest).st_uid).pw_name or "gpuconsole"
+        except Exception:
+            app_user = "gpuconsole"
+        if not _USER_RE.match(app_user):
+            r["msg"] = "应用用户名异常（%r），拒绝写入 sudoers；请走 SSH 手动授权" % app_user
+            _grant_state.update(running=False, result=r, finished=time.time())
+            return
+        img = _docker_image()
+        if not img:
+            r["msg"] = "本机没有任何 docker 镜像可用（docker images 为空）"
+            _grant_state.update(running=False, result=r, finished=time.time())
+            return
+        # 容器内路径 = /host + 宿主真实路径（realpath 已解开 target 软链）
+        c_src = "/host" + src_script
+        res = [f for f in ("libstagefrighthw32.so", "vdec_test3.c", "media_codecs.xml")
+               if os.path.isfile(os.path.join(real_dest, "scripts", f))]
+        cp_res = " ".join("cp -f %s /host/usr/local/lib/oesp-gpu/;" % ("/host" + real_dest + "/scripts/" + f)
+                          for f in res)
+        inner = (
+            "set -e; "
+            "mkdir -p /host/usr/local/lib/oesp-gpu /host/etc/sudoers.d; "
+            "cp -f {src} /host/usr/local/lib/oesp-gpu/oesp_gpu_fix.sh; "
+            "{cp_res}"
+            "chown -R 0:0 /host/usr/local/lib/oesp-gpu; "
+            "chmod 755 /host/usr/local/lib/oesp-gpu /host/usr/local/lib/oesp-gpu/oesp_gpu_fix.sh; "
+            "printf '%s\\n' '# fnOS app gpuconsole: only the fixed fix script is allowed. Revoke: sudo rm -f /etc/sudoers.d/gpuconsole-fix /usr/local/lib/oesp-gpu/oesp_gpu_fix.sh' > /host/etc/sudoers.d/gpuconsole-tmp; "
+            "printf '%s\\n' '{rule}' >> /host/etc/sudoers.d/gpuconsole-tmp; "
+            "chown 0:0 /host/etc/sudoers.d/gpuconsole-tmp; chmod 440 /host/etc/sudoers.d/gpuconsole-tmp; "
+            "VC=skipped; "
+            "if chroot /host visudo -cf /etc/sudoers.d/gpuconsole-tmp >/dev/null 2>&1; then VC=ok; "
+            "elif ! chroot /host sh -c 'command -v visudo' >/dev/null 2>&1; then VC=skipped; "
+            "else VC=failed; fi; "
+            "if [ \"$VC\" = failed ]; then rm -f /host/etc/sudoers.d/gpuconsole-tmp; echo VCHECK=failed; exit 3; fi; "
+            "mv -f /host/etc/sudoers.d/gpuconsole-tmp /host/etc/sudoers.d/gpuconsole-fix; "
+            "echo VCHECK=$VC; echo GRANT_OK"
+        ).format(src=c_src, cp_res=cp_res,
+                 rule=app_user + " ALL=(root) NOPASSWD: /usr/local/lib/oesp-gpu/oesp_gpu_fix.sh")
+        cmd = ["docker", "run", "--rm", "--network", "none", "-v", "/:/host",
+               "--entrypoint", "/bin/sh", img, "-c", inner]
+        log("一键授权: docker run %s (user=%s)" % (img, app_user))
+        try:
+            p = subprocess.run(cmd, capture_output=True, timeout=90)
+            out = (p.stdout or b"").decode("utf-8", "replace")
+            err = (p.stderr or b"").decode("utf-8", "replace")
+            r["log"] = (out + ("\n[stderr] " + err if err.strip() else ""))[:1500]
+            r["vcheck"] = "ok" if "VCHECK=ok" in out else ("failed" if "VCHECK=failed" in out else "skipped")
+            if p.returncode == 0 and "GRANT_OK" in out:
+                if can_root(force=True):
+                    r.update(ok=True, via="docker",
+                             msg="授权完成（sudoers 校验: %s）。宿主层修补与 GE2D/AVE 修复已解锁。" % r["vcheck"])
+                else:
+                    r["msg"] = ("sudoers 已写入但验证未通过（ uncommon？）。请走 SSH 执行: "
+                                "sudo bash %s" % GRANT_SH)
+            elif p.returncode == 126 or p.returncode == 127:
+                r["msg"] = "容器内缺少 sh/chroot 等工具（镜像: %s）。请走 SSH 执行: sudo bash %s" % (img, GRANT_SH)
+            else:
+                r["msg"] = "docker 执行失败(rc=%s)。请走 SSH 执行: sudo bash %s" % (p.returncode, GRANT_SH)
+        except subprocess.TimeoutExpired:
+            r["msg"] = "docker 执行超时（90s）。请走 SSH 执行: sudo bash %s" % GRANT_SH
+        except FileNotFoundError:
+            r["msg"] = "docker 命令不可用。请走 SSH 执行: sudo bash %s" % GRANT_SH
+    except Exception as e:
+        r["msg"] = "授权异常: %s" % str(e)[:200]
+    _grant_state.update(running=False, result=r, finished=time.time())
+    log("一键授权完成: ok=%s via=%s %s" % (r.get("ok"), r.get("via"), r.get("msg", "")[:80]))
+
+
+def grant_start():
+    if _grant_state["running"]:
+        return {"started": False, "reason": "授权任务已在进行中"}
+    if time.time() - _grant_state.get("finished", 0) < 2 and _grant_state.get("result"):
+        # 防双击：刚完成 2 秒内直接回上一次结果
+        return {"started": True, "already_done": True}
+    _grant_state.update(running=True, result=None, started=time.time())
+    threading.Thread(target=_grant_job, daemon=True).start()
+    return {"started": True}
+
+
+def grant_status():
+    return {
+        "running": _grant_state["running"],
+        "elapsed": round(time.time() - _grant_state["started"], 1) if _grant_state["running"] else 0,
+        "result": _grant_state["result"],
+    }
 
 
 def do_repair(level):
@@ -928,14 +1123,23 @@ def handle_request(conn):
         elif bare == "/api/version":
             send(conn, "200 OK", "application/json; charset=utf-8",
                  json.dumps({"version": VERSION, "app": APP_NAME}).encode())
-        elif bare == "/api/detect":
-            t0 = time.time()
-            d = run_detect()
-            d["elapsed"] = round(time.time() - t0, 1)
+        elif bare in ("/api/detect", "/api/detect_poll"):
+            # 2026-10-12：体检异步化。旧实现同步等脚本跑完（最长 150s），长请求穿过
+            # 飞牛 nginx 网关时会被网关超时/重置 → 浏览器 "Failed to fetch"。
+            # 现在：/api/detect = 确保后台在跑并立即返回状态；/api/detect_poll = 只查状态。
+            if bare == "/api/detect":
+                d = detect_start()
+            else:
+                d = detect_status()
+            send(conn, "200 OK", "application/json; charset=utf-8",
+                 json.dumps(d, ensure_ascii=False).encode("utf-8"))
+        elif bare == "/api/grant":
+            d = grant_start()
+            send(conn, "200 OK", "application/json; charset=utf-8",
+                 json.dumps(d, ensure_ascii=False).encode("utf-8"))
+        elif bare == "/api/grant_poll":
+            d = grant_status()
             d["can_root"] = can_root()
-            d["fix_script"] = fix_script()
-            d["grant_cmd"] = "sudo bash %s" % GRANT_SH
-            d["granted"] = os.path.isfile(FIX_SH_SECURE)
             send(conn, "200 OK", "application/json; charset=utf-8",
                  json.dumps(d, ensure_ascii=False).encode("utf-8"))
         elif bare == "/api/repair":
@@ -966,20 +1170,23 @@ def handle_request(conn):
                  json.dumps(d, ensure_ascii=False).encode("utf-8"))
         elif bare == "/api/ge2d":
             # action=status（默认，走 15s 缓存）| selftest | fix
+            # 2026-10-12：旧代码 status 时 force=True，等于每次都 spawn 脚本进程，
+            # 15s 缓存形同虚设（实测拖慢面板、放大网关长请求风险）。动作后本就会
+            # 置缓存时间戳为 0 强制重查，这里 status 恒走缓存。
             act = "status"
             for k in ("selftest", "fix"):
                 if ("action=" + k) in target:
                     act = k
-            d = ge2d_info(force=(act == "status")) if act == "status" else ge2d_action(act)
+            d = ge2d_info() if act == "status" else ge2d_action(act)
             send(conn, "200 OK", "application/json; charset=utf-8",
                  json.dumps(d, ensure_ascii=False).encode("utf-8"))
         elif bare == "/api/ave":
-            # action=status（默认，走 15s 缓存）| selftest | fix
+            # action=status（默认，走 15s 缓存）| selftest | fix（同上，修正缓存）
             act = "status"
             for k in ("selftest", "fix"):
                 if ("action=" + k) in target:
                     act = k
-            d = ave_info(force=True) if act == "status" else ave_action(act)
+            d = ave_info() if act == "status" else ave_action(act)
             send(conn, "200 OK", "application/json; charset=utf-8",
                  json.dumps(d, ensure_ascii=False).encode("utf-8"))
         elif bare == "/api/gpu-freq":
@@ -1494,7 +1701,9 @@ function showErr(msg){
     + '<button class="btn" style="margin-left:6px" onclick="location.reload()">重新加载本页</button>';
 }
 
-async function gwFetch(p, timeout){
+function sleep(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
+
+async function gwFetch(p, timeout, retries){
   const ac = new AbortController();
   const tm = setTimeout(function(){ ac.abort(); }, timeout || 12000);
   const url = apiUrl(p), t0 = Date.now();
@@ -1510,6 +1719,12 @@ async function gwFetch(p, timeout){
     if (j && j.token) gwToken = j.token;      // 网关若下发新票据，后续请求自动沿用
     return j;
   }catch(e){
+    // 网络层失败（浏览器表现为 TypeError: Failed to fetch，多因网关连接被重置）：
+    // 幂等 GET 自动重试。AbortError（主动超时）与票据错误不重试。
+    if (retries > 0 && (e instanceof TypeError)){
+      await sleep(800);
+      return gwFetch(p, timeout, retries - 1);
+    }
     if (e && e.name === 'AbortError') throw new Error('请求超时（' + (timeout || 12000) + 'ms 未返回）');
     throw e;
   } finally { clearTimeout(tm); }
@@ -1910,14 +2125,30 @@ function renderAndroid(d){
 }
 
 // ---------- 体检 ----------
-let lastDetect = null, pollTimer = null;
+// 2026-10-12：体检异步化。旧实现一次同步请求等脚本跑完（最长 150s），长请求穿过
+// 飞牛 nginx 网关会被超时/重置 → 浏览器 "Failed to fetch"（修补完成后的自动复检
+// 必现）。现在启动后台任务 + 1.2s 轮询取结果，HTTP 请求本身毫秒级返回。
+let lastDetect = null, pollTimer = null, detectT0 = 0;
 
 async function detect(){
   const b = $('btnDetect');
-  b.disabled = true; $('scoresub').textContent = '检测中…（需跑若干条 docker 探测，约 3-10 秒）';
+  b.disabled = true; detectT0 = Date.now();
+  $('scoresub').textContent = '检测中…（后台执行，约 3-20 秒）';
   try{
-    const d = await gwFetch('api/detect', 60000);
-    renderDetect(d);
+    await gwFetch('api/detect', 10000, 1);          // 启动后台体检（立即返回）
+    for (let i = 0; i < 200; i++){                  // 轮询，最多约 240s
+      await sleep(1200);
+      let s = null;
+      try{ s = await gwFetch('api/detect_poll', 10000, 2); }
+      catch(e){ continue; }                         // 单次轮询失败不放弃（网络抖动）
+      if (s && s.result && !s.running){ renderDetect(s.result); b.disabled = false; return; }
+      if (s && !s.running && !s.result){
+        $('scoresub').textContent = '检测未产生结果，可点"重新检测"重试';
+        b.disabled = false; return;
+      }
+      $('scoresub').textContent = '检测中… ' + Math.round((Date.now() - detectT0)/1000) + ' 秒';
+    }
+    $('scoresub').textContent = '检测超时，可点"重新检测"重试';
   }catch(e){
     $('scoresub').textContent = '检测失败: ' + ((e && e.message) ? e.message : e);
   }
@@ -1949,13 +2180,20 @@ function renderDetect(d){
     : '<tr><td colspan="2" style="color:var(--green)">✓ 全部检测项正常</td></tr>';
 
   const np = $('nopriv');
+  window.__grantCmd = d.grant_cmd || 'sudo bash /var/apps/gpuconsole/target/scripts/grant_root.sh';
   if (!d.can_root){
     np.style.display = 'block';
-    np.innerHTML = '当前<b>没有 root 权限</b>，②③ 按钮不可用（① 不需要 root，照常可用）。'
-      + '<br>只需在 SSH 里执行<b>一次</b>授权命令，之后就永久可用：'
-      + '<div style="margin:8px 0"><code>' + (d.grant_cmd || 'sudo bash /var/apps/gpuconsole/target/scripts/grant_root.sh') + '</code></div>'
-      + '<span style="color:var(--dim)">它会把修补脚本复制到 root 拥有的目录再放行（仅这一个脚本），'
-      + '不会开放 shell。升级本应用后重跑一次即可同步新版脚本。</span>';
+    np.innerHTML = '当前<b>没有 root 权限</b>，②③ 按钮与「重载补丁模块 / AVE 修复」不可用'
+      + '（① 容器层修补和两个「一键自检」不需要 root，照常可用）。'
+      + '<br><b>方式一（推荐）</b>：用应用的 Docker 权限自动完成授权，无需 SSH —— '
+      + '<button class="btn btn-warn" style="margin:4px 0" id="btnGrant">一键授权（免 SSH）</button>'
+      + '<br><b>方式二</b>：在 SSH 里执行一次（永久生效）：'
+      + '<div style="margin:8px 0"><code>' + window.__grantCmd + '</code>'
+      + ' <button class="btn" style="margin-left:6px" onclick="copyGrant(this)">复制</button></div>'
+      + '<span style="color:var(--dim)">两种方式等效：把修补脚本固化到 root 拥有的目录、'
+      + 'sudoers 只放行该脚本，不开放 shell。升级应用后请重新授权一次以同步新版脚本。</span>';
+    const g = $('btnGrant');
+    if (g) g.onclick = doGrant;
     $('btnFixH').disabled = true; $('btnFixR').disabled = true;
   } else {
     np.style.display = 'none';
@@ -1973,6 +2211,55 @@ function renderDetect(d){
     af.disabled = !d.can_root;
     af.title = d.can_root ? '' : '需要 root：先在 SSH 里执行一次授权命令';
   }
+}
+
+// ---------- 授权 ----------
+// 方式二：复制 SSH 命令
+function copyGrant(btn){
+  const t = window.__grantCmd || 'sudo bash /var/apps/gpuconsole/target/scripts/grant_root.sh';
+  const done = function(){ btn.textContent = '已复制'; setTimeout(function(){ btn.textContent = '复制'; }, 1500); };
+  try{
+    if (navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(t).then(done, done); return;
+    }
+  }catch(e){}
+  try{
+    const ta = document.createElement('textarea');
+    ta.value = t; document.body.appendChild(ta); ta.select();
+    document.execCommand('copy'); document.body.removeChild(ta);
+  }catch(e){}
+  done();
+}
+
+// 方式一：应用内一键授权（走 /api/grant 后台任务，docker 权限写 sudoers + 固化脚本）
+async function doGrant(){
+  if (!confirm('将使用本应用的 Docker 权限自动完成 root 授权：\n'
+    + '· 把修补脚本固化到 /usr/local/lib/oesp-gpu/（root 目录）\n'
+    + '· 写入仅放行该脚本的 sudoers 规则\n'
+    + '· 效果与你在 SSH 里执行 grant_root.sh 完全一致\n\n继续？')) return;
+  const b = $('btnGrant');
+  if (b){ b.disabled = true; b.textContent = '授权中…'; }
+  try{ await gwFetch('api/grant', 10000, 1); }catch(e){ /* 启动失败也会在轮询里看到 */ }
+  for (let i = 0; i < 60; i++){
+    await sleep(1500);
+    let s = null;
+    try{ s = await gwFetch('api/grant_poll', 10000, 2); }catch(e2){ continue; }
+    if (!s || !s.running){
+      if (b){ b.disabled = false; b.textContent = '一键授权（免 SSH）'; }
+      const r = s && s.result ? s.result : null;
+      if (r && r.ok){
+        if (b) b.textContent = '已授权';
+        $('scoresub').textContent = '授权成功，正在重新体检…';
+        detect();                       // 成功后自动复检，按钮随 can_root 解锁
+      } else {
+        $('scoresub').textContent = '自动授权未成功: ' + (r && r.msg ? r.msg : '未知') 
+          + '。可用方式二（SSH 执行 grant_root.sh）兜底。';
+      }
+      return;
+    }
+  }
+  if (b){ b.disabled = false; b.textContent = '一键授权（免 SSH）'; }
+  $('scoresub').textContent = '授权超时，可用方式二（SSH 执行 grant_root.sh）兜底。';
 }
 
 // ---------- 修补 ----------
