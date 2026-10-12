@@ -15,7 +15,7 @@
 | 内容 | 路径 | 说明 |
 |---|---|---|
 | **GPU 控制台源码** | `gpu-console/` | 飞牛 fnOS 原生应用（FPK）完整工程，Python 3 单文件后端 + 前端 + 修补脚本 |
-| **FPK 安装包** | `release/gpuconsole_1.3.5.fpk` | 可直接安装到飞牛设备的成品包（最新版；`release/` 下保留历史版本） |
+| **FPK 安装包** | `release/gpuconsole_1.3.6.fpk` | 可直接安装到飞牛设备的成品包（最新版；`release/` 下保留历史版本） |
 | **部分测试数据** | `docs/` | 19 篇真机实测报告，**已脱敏** |
 
 ---
@@ -97,9 +97,15 @@ NV12 要搬两次、V4L2 syscall 开销重、最后还要软件做 YUV→RGB，
 | **常驻自愈** | cron 每分钟：插件注入、权限硬化、mediaserver codec 缓存刷新；另配完整性守卫，主脚本被断电截断时自动从备份恢复 |
 | **一键切 GPU 直通** | 改 compose 并重建容器（会中断服务） |
 | **软/硬解切换** | v1.1.0 新增，附实测数据说明 |
+| **一键授权（免 SSH）** | v1.3.6 新增：用应用的 Docker 权限按与 `grant_root.sh` 完全相同的安全边界自动完成 root 授权，无需手动 SSH |
 | 命令行查询 | `gpu_status.sh` 可在 SSH 直接用，不依赖 Web |
 
 界面采用 fnOS 2.0+ 深色主题，中文。
+
+> **v1.3.6 起后端接口全面加固**：20+ 项硬件体检改为后台任务 + 前端轮询，
+> 不再有穿越飞牛 nginx 网关的长请求（此前体检完成后的自动复检必现 `Failed to fetch`）；
+> 所有幂等请求带网络层自动重试，瞬时抖动不再弹「读不到监控数据」。
+> 同时新增**免 SSH 一键授权**，新设备装完即可解锁宿主层修补按钮。
 
 ### 2.4 硬件编码（AVE / HCODEC）性能实测 ✅
 
@@ -157,11 +163,13 @@ cd oesp-gpu-console/gpu-console && bash build_fpk.sh
 # → ../gpuconsole_<版本>.fpk
 
 # 2) 在飞牛设备上安装
-appcenter-cli install-fpk gpuconsole_1.3.5.fpk -v 1
+appcenter-cli install-fpk gpuconsole_1.3.6.fpk -v 1
 # 注意：同 appname 不会升级，需先 uninstall 再 install
 #       ⛔ uninstall 子命令不接受 -v 参数（写了只打印 Usage，看起来安装成功实则未替换文件）
 
-# 3) （可选）授予宿主层修补所需的 root 权限，只需跑一次
+# 3) （可选，v1.3.6 起可不做）授予宿主层修补所需的 root 权限，只需跑一次
+#    方式一：在面板点「一键授权（免 SSH）」，无需终端
+#    方式二：SSH 里执行
 sudo bash /var/apps/gpuconsole/target/scripts/grant_root.sh
 ```
 
