@@ -1704,6 +1704,9 @@ function showErr(msg){
 function sleep(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
 
 async function gwFetch(p, timeout, retries){
+  // 默认所有幂等 GET 都带 2 次网络层重试（此前只有体检/授权调用点传了 retries，
+  // load() 里的 api/status / api/history 没传 → undefined > 0 恒假 → 重试形同虚设）
+  if (retries === undefined) retries = 2;
   const ac = new AbortController();
   const tm = setTimeout(function(){ ac.abort(); }, timeout || 12000);
   const url = apiUrl(p), t0 = Date.now();
@@ -1739,12 +1742,15 @@ async function refreshToken(){
   return false;
 }
 
+let failStreak = 0;            // 连续失败计数：瞬时抖动不打扰用户，连续 3 次才弹红框
+
 async function load(){
   if (loading) return;                        // 防止 2 秒轮询叠加
   loading = true;
   try{
     const d = await gwFetch('api/status', 12000);
     render(d);
+    failStreak = 0;
     if (d && d.decoder){ window.__dec = d.decoder; decRender(); }
     $('errbox').style.display = 'none';
     try{ draw(await gwFetch('api/history', 12000)); }catch(e){}
@@ -1762,12 +1768,21 @@ async function load(){
       try{
         const d = await gwFetch('api/status', 12000);
         render(d);
+        failStreak = 0;
         $('errbox').style.display = 'none';
         try{ draw(await gwFetch('api/history', 12000)); }catch(e2){}
         if (firstDetect){ firstDetect = false; detect(); }
         loading = false;
         return;
       }catch(e2){ e = e2; }
+    }
+    // 瞬时抖动（重试后仍偶发失败）：保留已渲染的旧数据，仅在副标题轻提示；
+    // 连续 3 轮都失败才认为真的读不到数据，弹红框引导换票据/重开页面
+    failStreak++;
+    if (failStreak < 3){
+      $('sub').textContent = '网络抖动，正在自动恢复…（保留上次数据）';
+      loading = false;
+      return;
     }
     showErr(String((e && e.message) ? e.message : e));
   }
