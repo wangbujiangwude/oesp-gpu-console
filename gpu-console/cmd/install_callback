@@ -22,14 +22,43 @@ log(){ echo "[$(date '+%F %T')] install_callback: $*" >> "$VAR_DIR/cmd.log" 2>/d
 APP_USER=$(stat -c %U "$APP_DEST" 2>/dev/null)
 [ -z "$APP_USER" ] || [ "$APP_USER" = "UNKNOWN" ] && APP_USER="gpuconsole"
 FIX_SH="$APP_DEST/scripts/oesp_gpu_fix.sh"
+SEC_DIR=/usr/local/lib/oesp-gpu
+SEC_SH="$SEC_DIR/oesp_gpu_fix.sh"
+
+# ---- 固化副本：与「一键授权」用同一套路径 ----
+# 网关的 fix_script() 优先用 $SEC_DIR/oesp_gpu_fix.sh；若 sudoers 只放行应用目录
+# 那份，就会出现「网关挑固化副本、sudo 只认应用目录」的错位 —— 重装或授权过旧版的
+# 机器必然踩到。安装时就把副本建好、sudoers 直接指向它，两边永远一致。
+sync_secure_copy() {
+    [ -f "$FIX_SH" ] || return 0
+    mkdir -p "$SEC_DIR/deploy" 2>/dev/null
+    cp -f "$FIX_SH" "$SEC_SH" 2>/dev/null && chmod 755 "$SEC_SH"
+    local d="$APP_DEST/scripts/deploy" f b
+    if [ -d "$d" ]; then
+        for f in "$d"/*; do
+            [ -f "$f" ] || continue
+            b=$(basename "$f")
+            case "$b" in
+                # .ko 已存在就不动：设备上可能按当前内核重编过，覆盖反而 vermagic 不符
+                *.ko) [ -f "$SEC_DIR/deploy/$b" ] || cp -f "$f" "$SEC_DIR/deploy/$b" 2>/dev/null ;;
+                *)    cp -f "$f" "$SEC_DIR/deploy/$b" 2>/dev/null ;;
+            esac
+        done
+    fi
+    chown -R 0:0 "$SEC_DIR" 2>/dev/null
+    sync
+    log "固化副本已就位: $SEC_SH（deploy/ $(ls -1 "$SEC_DIR/deploy" 2>/dev/null | wc -l) 个文件）"
+}
 
 if [ "$(id -u)" = "0" ] && [ -f "$FIX_SH" ]; then
+    sync_secure_copy
+    [ -f "$SEC_SH" ] || SEC_SH="$FIX_SH"
     SF=/etc/sudoers.d/gpuconsole-fix     # 文件名不能含 "." ，否则 sudoers.d 会忽略
     TMP="$SF.tmp.$$"
     cat > "$TMP" <<EOF
 # fnOS 应用 gpuconsole：仅允许免密执行本应用自带的一键修补脚本
 # （安装钩子自动生成；卸载时由 uninstall_callback 删除）
-$APP_USER ALL=(root) NOPASSWD: $FIX_SH
+$APP_USER ALL=(root) NOPASSWD: $SEC_SH
 EOF
     if command -v visudo >/dev/null 2>&1 && visudo -cf "$TMP" >/dev/null 2>&1; then
         mv "$TMP" "$SF" && chmod 440 "$SF" && chown root:root "$SF" 2>/dev/null

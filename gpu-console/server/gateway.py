@@ -37,7 +37,7 @@ try:
 except Exception:
     fcntl = None
 
-VERSION = "1.3.8"
+VERSION = "1.3.9"
 APP_NAME = "gpuconsole"
 
 APP_DEST = os.environ.get("TRIM_APPDEST", "/var/apps/gpuconsole/target")
@@ -351,7 +351,11 @@ def gpu_clients(force=False):
         fx = fix_script()
         if os.path.isfile(fx):
             try:
-                r = _run(["sudo", "-n", fx, "--gpu-clients"], 25)
+                # ⚠ 不要再手写 "sudo","-n"：_run() 内部已经加了。写成
+                #   _run(["sudo","-n",fx,...]) 实际执行的是 `sudo -n sudo -n <脚本>`，
+                #   sudoers 只放行脚本本身，内层 sudo 匹配不上 → 每次 "a password is
+                #   required"，6 秒一次刷日志（现场 gateway.log 被这条刷到 27 MB）。
+                r = _run([fx, "--gpu-clients"], 25)
                 txt = (r.stdout or b"").decode("utf-8", "replace").strip()
                 if txt.startswith("["):
                     out = json.loads(txt)

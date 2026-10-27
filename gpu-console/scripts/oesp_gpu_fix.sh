@@ -123,6 +123,11 @@ ge2d_probe_dev() {
 
 ge2d_run_selftest() {   # ge2d_run_selftest [边长] [次数]
     local side="${1:-512}" rep="${2:-10}"
+    # ⚠ v1.3.9 修复：包内 deploy/ge2d_selftest 是【预编译 aarch64 二进制】（只依赖 libc.so.6），
+    #   但旧版这里只尝试 gcc 现场编译、没调 deploy_deps —— 新装机没有 gcc，于是「一键自检」
+    #   永远报"二进制缺失且无法现场编译"（体检那条路先调了 deploy_deps 所以是绿的，两条路不一致）。
+    #   deploy_deps 需 root；--selftest 走的是已放行的 sudo 通道，满足条件。
+    [ -x "$GE2D_BIN" ] || deploy_deps
     if [ ! -x "$GE2D_BIN" ]; then
         if [ ! -f "$GE2D_SRC" ] && [ -f "$SELF_DIR/ge2d_selftest.c" ]; then
             mkdir -p /usr/local/lib/oesp-gpu/ge2d 2>/dev/null
@@ -263,26 +268,50 @@ AVE_ENC_LOADED=0; AVE_DEV=""; AVE_REGFIX=0; AVE_CRON=0; AVE_REGMOD=0
 # 全新安装的机器上「重载补丁模块 / 一键修复」不再报"部署物未安装"。
 # .ko 是按 fnOS 同版本内核（6.18.18.c997-trim）预编译的；部署前做 vermagic
 # 校验，内核不匹配就不部署（宁可保持"缺失"报错，也不 insmod 一个不兼容模块）。
-DEPLOY_DIR="$SELF_DIR/deploy"
-# ⚠ 兜底：授权后跑的是固化副本（/usr/local/lib/oesp-gpu/oesp_gpu_fix.sh），
-#   旧版 grant_root.sh / 一键授权只固化了脚本本体、没带 deploy/ —— 那时从
-#   应用安装目录取件（应用目录可被应用用户写，但运行到这里必然已经过授权，
-#   且 docker 组用户本就等同 root，不构成新增提权面）。
-[ -d "$DEPLOY_DIR" ] || DEPLOY_DIR="/var/apps/gpuconsole/target/scripts/deploy"
+# ⚠ v1.3.9 起改成【逐文件解析】，不再只认一个目录。
+#   现场（用户装机）踩到的坑：一键授权把脚本固化到 /usr/local/lib/oesp-gpu/ 之后，
+#   脚本旁边没有 deploy/（旧版授权只固化脚本本体），于是所有修补动作都报
+#   「包内 deploy/ 也未找到」——而应用安装目录里 deploy/ 一直在。
+#   所以按优先级列出候选目录，每个文件分别找；固化副本旁那个"残缺 deploy/"
+#   （可能只有 ge2d_oesp.ko）也不再挡住其它文件。
+DEPLOY_CANDIDATES="$SELF_DIR/deploy
+$SELF_DIR/../scripts/deploy
+/var/apps/gpuconsole/target/scripts/deploy
+/vol1/@appcenter/gpuconsole/scripts/deploy"
+
+deploy_src() {   # deploy_src <deploy内文件名> -> 打印第一份真实存在的绝对路径（找不到返回 1）
+    local f="$1" d
+    for d in $DEPLOY_CANDIDATES; do
+        [ -f "$d/$f" ] && { printf '%s/%s\n' "$d" "$f"; return 0; }
+    done
+    return 1
+}
+
+deploy_primary_dir() {   # 写回目录：优先"带部署物的那份"，否则第一个存在的候选
+    local d
+    for d in $DEPLOY_CANDIDATES; do
+        [ -f "$d/ge2d_oesp.ko" ] || [ -f "$d/regfix_ensure.sh" ] || continue
+        printf '%s\n' "$d"; return 0
+    done
+    for d in $DEPLOY_CANDIDATES; do
+        [ -d "$d" ] && { printf '%s\n' "$d"; return 0; }
+    done
+    printf '%s\n' "$SELF_DIR/deploy"
+}
+DEPLOY_DIR="$(deploy_primary_dir)"
 
 deploy_missing_reason() {  # deploy_missing_reason <deploy内文件名>  输出诊断（不含双引号，供 JSON 拼接）
-    local f="$1"
-    if [ ! -d "$DEPLOY_DIR" ]; then
-        echo "包内 deploy/ 未找到（找过 $SELF_DIR/deploy 与 /var/apps/gpuconsole/target/scripts/deploy）"
-        return
-    fi
-    if [ ! -f "$DEPLOY_DIR/$f" ]; then
-        echo "包内 deploy/ 缺 $f（DEPLOY_DIR=$DEPLOY_DIR）"
+    local f="$1" p seen=""
+    local d
+    for d in $DEPLOY_CANDIDATES; do seen="$seen $d"; done
+    p="$(deploy_src "$f")"
+    if [ -z "$p" ]; then
+        echo "包内 deploy/ 下找不到 $f（找过$seen）；若是旧版授权留下的固化副本，把应用目录 scripts/deploy 拷到 /usr/local/lib/oesp-gpu/deploy 或重跑一键授权"
         return
     fi
     local vm
-    vm=$(grep -aom1 'vermagic=[^ ]*' "$DEPLOY_DIR/$f" 2>/dev/null | sed 's/^vermagic=//')
-    echo "包内部署物在，但本机内核 $(uname -r) 与其 vermagic（${vm:-未知}）不匹配，拒绝加载${BUILD_NOTE:+（$BUILD_NOTE）}"
+    vm=$(grep -aom1 'vermagic=[^ ]*' "$p" 2>/dev/null | sed 's/^vermagic=//')
+    echo "包内部署物在（$p），但本机内核 $(uname -r) 与其 vermagic（${vm:-未知}）不匹配，拒绝加载${BUILD_NOTE:+（$BUILD_NOTE）}"
 }
 
 ko_vermagic_ok() {  # ko_vermagic_ok <file>  当前内核能加载该 ko 吗（vermagic 前缀比对）
@@ -324,26 +353,27 @@ deploy_build_one() {    # deploy_build_one <ko名> <Makefile名> —— 包内 k
 
 deploy_deps() {    # 从包内 deploy/ 补齐缺失的宿主部署物（需 root；幂等；vermagic 失配时现场重编）
     [ "$IS_ROOT" = "1" ] || return 0
-    [ -d "$DEPLOY_DIR" ] || return 0
+    local src sel
     # -- ge2d 补丁模块 + 自检程序 --
     # 系统更新场景：目标 ko 还在但 vermagic 已失配 → 同样要补（先现场重编再落位）
-    if [ -f "$DEPLOY_DIR/ge2d_oesp.ko" ]; then
+    src="$(deploy_src ge2d_oesp.ko)"
+    if [ -n "$src" ]; then
         if [ ! -f "$GE2D_KO" ] || ! ko_vermagic_ok "$GE2D_KO"; then
-            if ! ko_vermagic_ok "$DEPLOY_DIR/ge2d_oesp.ko"; then
-                deploy_build_one ge2d_oesp.ko Makefile.ge2d
-            fi
-            if ko_vermagic_ok "$DEPLOY_DIR/ge2d_oesp.ko"; then
+            ko_vermagic_ok "$src" || { deploy_build_one ge2d_oesp.ko Makefile.ge2d; src="$(deploy_src ge2d_oesp.ko)"; }
+            if [ -n "$src" ] && ko_vermagic_ok "$src"; then
                 mkdir -p "$(dirname "$GE2D_KO")" 2>/dev/null
-                cp "$DEPLOY_DIR/ge2d_oesp.ko" "$GE2D_KO" 2>/dev/null && chmod 644 "$GE2D_KO" && sync
+                cp "$src" "$GE2D_KO" 2>/dev/null && chmod 644 "$GE2D_KO" && sync
             fi
         fi
     fi
-    if [ ! -x "$GE2D_BIN" ] && [ -f "$DEPLOY_DIR/ge2d_selftest" ]; then
+    sel="$(deploy_src ge2d_selftest)"
+    if [ ! -x "$GE2D_BIN" ] && [ -n "$sel" ]; then
         mkdir -p "$(dirname "$GE2D_BIN")" 2>/dev/null
-        cp "$DEPLOY_DIR/ge2d_selftest" "$GE2D_BIN" 2>/dev/null && chmod 755 "$GE2D_BIN" && sync
+        cp "$sel" "$GE2D_BIN" 2>/dev/null && chmod 755 "$GE2D_BIN" && sync
     fi
     # -- AVE regfix 自愈（脚本 + ko + 源码/Makefile 兜底）--
-    if [ -f "$DEPLOY_DIR/regfix_ensure.sh" ]; then
+    src="$(deploy_src regfix_ensure.sh)"
+    if [ -n "$src" ]; then
         local need=0
         [ ! -f "$AVE_REGFIX_SH" ] && need=1
         if [ ! -f "$AVE_REGFIX_DIR/oesp_regfix.ko" ] \
@@ -354,20 +384,22 @@ deploy_deps() {    # 从包内 deploy/ 补齐缺失的宿主部署物（需 root
             mkdir -p "$AVE_REGFIX_DIR" 2>/dev/null
             if [ ! -f "$AVE_REGFIX_DIR/oesp_regfix.ko" ] \
                || ! ko_vermagic_ok "$AVE_REGFIX_DIR/oesp_regfix.ko"; then
-                if [ ! -f "$DEPLOY_DIR/oesp_regfix.ko" ] \
-                   || ! ko_vermagic_ok "$DEPLOY_DIR/oesp_regfix.ko"; then
+                local rko rsrc
+                rko="$(deploy_src oesp_regfix.ko)"
+                if [ -z "$rko" ] || ! ko_vermagic_ok "$rko"; then
                     deploy_build_one oesp_regfix.ko Makefile.regfix
+                    rko="$(deploy_src oesp_regfix.ko)"
                 fi
-                if [ -f "$DEPLOY_DIR/oesp_regfix.ko" ] \
-                   && ko_vermagic_ok "$DEPLOY_DIR/oesp_regfix.ko"; then
-                    cp "$DEPLOY_DIR/oesp_regfix.ko" "$AVE_REGFIX_DIR/" 2>/dev/null
-                    cp "$DEPLOY_DIR/oesp_regfix.c"  "$AVE_REGFIX_DIR/" 2>/dev/null
-                    [ -f "$DEPLOY_DIR/Makefile.regfix" ] \
-                        && cp "$DEPLOY_DIR/Makefile.regfix" "$AVE_REGFIX_DIR/Makefile" 2>/dev/null
+                if [ -n "$rko" ] && ko_vermagic_ok "$rko"; then
+                    cp "$rko" "$AVE_REGFIX_DIR/" 2>/dev/null
+                    rsrc="$(deploy_src oesp_regfix.c)"
+                    [ -n "$rsrc" ] && cp "$rsrc" "$AVE_REGFIX_DIR/" 2>/dev/null
+                    rsrc="$(deploy_src Makefile.regfix)"
+                    [ -n "$rsrc" ] && cp "$rsrc" "$AVE_REGFIX_DIR/Makefile" 2>/dev/null
                 fi
             fi
             if [ ! -f "$AVE_REGFIX_SH" ]; then
-                cp "$DEPLOY_DIR/regfix_ensure.sh" "$AVE_REGFIX_SH" 2>/dev/null \
+                cp "$src" "$AVE_REGFIX_SH" 2>/dev/null \
                     && chmod 755 "$AVE_REGFIX_SH"
             fi
             sync
@@ -409,7 +441,9 @@ ave_status_json() {
 
 ave_selftest_json() {   # 720p × 10 帧真编码 + ffmpeg 可解性校验（带安全门）
     if [ ! -f "$AVE_VPLIB" ]; then
-        echo "{\"ok\":false,\"msg\":\"编码库缺失：$AVE_VPLIB（AVE 测试资产未部署到 /root/vdec/ave）\"}"
+        # v1.3.9：原文案「测试资产未部署」会让用户以为装坏了。实情是 libvpcodec 属厂商私有库，
+        # 从未随发布包分发（包内只有 avetest10.c 源码），任何机器装完都是这个样子。
+        echo "{\"ok\":false,\"msg\":\"编码库缺失：$AVE_VPLIB（libvpcodec 为厂商私有库，不随发布包提供，需自行部署；且 AVE 硬编在 S922X/c1151 上实测不可用，此项仅作参考）\"}"
         return 1
     fi
     ave_probe
