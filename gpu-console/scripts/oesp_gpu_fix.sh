@@ -219,7 +219,9 @@ ge2d_fix_json() {   # 需要 root
 #       抬 min_freq 即可让 cur 立刻跟随；写回 124999998 完全回滚。不改 governor、不碰电压。
 gpu_freq_json() {   # gpu_freq_json [status|auto|500|666|800]
     local g=/sys/class/devfreq/ffe40000.gpu
-    [ -d "$g" ] || { echo "{\"ok\":false,\"msg\":\"无 devfreq 节点（非 G12 平台？）\"}"; return 1; }
+    # ⚠ v1.3.10：旧文案写的是「（非 G12 平台？）」，那是误判 —— S922X 就是 G12B，
+    # 缺 devfreq 只说明本机走厂商 mali_kbase 路线、内核没导出 devfreq 节点。
+    [ -d "$g" ] || { echo "{\"ok\":false,\"msg\":\"本机内核未导出 $g（厂商私有调频，常见于 mali_kbase 路线）；频率读数与档位不可用\"}"; return 1; }
     local arg="${1:-status}" w=0
     case "$arg" in
         auto) echo 124999998 > "$g/min_freq" 2>/dev/null && w=1 ;;
@@ -280,7 +282,14 @@ $SELF_DIR/../scripts/deploy
 /vol1/@appcenter/gpuconsole/scripts/deploy"
 
 deploy_src() {   # deploy_src <deploy内文件名> -> 打印第一份真实存在的绝对路径（找不到返回 1）
-    local f="$1" d
+    # v1.3.10：先看按内核版本分发的目录 deploy/<uname -r>/，再退回平铺 deploy/。
+    # 起因：飞牛内核从 c997 升到 c1151，包内只有 c997 时所有修补按钮必然失败
+    # （没有 gcc 的机器上连"现场重编"这条退路都没有）。
+    local f="$1" d kv
+    kv=$(uname -r)
+    for d in $DEPLOY_CANDIDATES; do
+        [ -f "$d/$kv/$f" ] && { printf '%s/%s/%s\n' "$d" "$kv" "$f"; return 0; }
+    done
     for d in $DEPLOY_CANDIDATES; do
         [ -f "$d/$f" ] && { printf '%s/%s\n' "$d" "$f"; return 0; }
     done
@@ -306,7 +315,7 @@ deploy_missing_reason() {  # deploy_missing_reason <deploy内文件名>  输出�
     for d in $DEPLOY_CANDIDATES; do seen="$seen $d"; done
     p="$(deploy_src "$f")"
     if [ -z "$p" ]; then
-        echo "包内 deploy/ 下找不到 $f（找过$seen）；若是旧版授权留下的固化副本，把应用目录 scripts/deploy 拷到 /usr/local/lib/oesp-gpu/deploy 或重跑一键授权"
+        echo "包内 deploy/ 下找不到 $f（找过$seen，以及其下的 $(uname -r) 子目录）；若是旧版授权留下的固化副本，把应用目录 scripts/deploy 拷到 /usr/local/lib/oesp-gpu/deploy 或重跑一键授权"
         return
     fi
     local vm

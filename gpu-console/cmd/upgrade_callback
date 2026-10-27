@@ -30,7 +30,7 @@ sync_secure() {
     fi
     # deploy/：脚本与源码一律覆盖；.ko 只在【缺失】时补 —— 设备上可能已按当前
     # 内核现场重编过一份，用包内预编译版覆盖反而造成 vermagic 不符。
-    local d="$APP_DEST/scripts/deploy" f b n=0
+    local d="$APP_DEST/scripts/deploy" f b sd sb n=0
     if [ -d "$d" ]; then
         for f in "$d"/*; do
             [ -f "$f" ] || continue
@@ -40,6 +40,23 @@ sync_secure() {
                 *)    cp -f "$f" "$SEC_DIR/deploy/$b" 2>/dev/null ;;
             esac
             n=$((n + 1))
+        done
+        # v1.3.10：deploy/<内核版本>/ 子目录（按 vermagic 分发的预编译物）也要同步，
+        # 否则新脚本优先找的版本目录在固化副本旁是空的，又退回平铺位。
+        for sd in "$d"/*/; do
+            [ -d "$sd" ] || continue
+            sb=$(basename "$sd")
+            mkdir -p "$SEC_DIR/deploy/$sb" 2>/dev/null
+            for f in "$sd"*; do
+                [ -f "$f" ] || continue
+                b=$(basename "$f")
+                case "$b" in
+                    *.ko) [ -f "$SEC_DIR/deploy/$sb/$b" ] || cp -f "$f" "$SEC_DIR/deploy/$sb/$b" 2>/dev/null ;;
+                    *)    cp -f "$f" "$SEC_DIR/deploy/$sb/$b" 2>/dev/null ;;
+                esac
+                n=$((n + 1))
+            done
+            log "deploy/$sb 已同步"
         done
         log "deploy/ 已同步（包内 $n 个文件，目标目录 $(ls -1 "$SEC_DIR/deploy" 2>/dev/null | wc -l) 个）"
     else

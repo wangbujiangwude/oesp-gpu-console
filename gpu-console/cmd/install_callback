@@ -33,7 +33,7 @@ sync_secure_copy() {
     [ -f "$FIX_SH" ] || return 0
     mkdir -p "$SEC_DIR/deploy" 2>/dev/null
     cp -f "$FIX_SH" "$SEC_SH" 2>/dev/null && chmod 755 "$SEC_SH"
-    local d="$APP_DEST/scripts/deploy" f b
+    local d="$APP_DEST/scripts/deploy" f b sd sb
     if [ -d "$d" ]; then
         for f in "$d"/*; do
             [ -f "$f" ] || continue
@@ -43,6 +43,20 @@ sync_secure_copy() {
                 *.ko) [ -f "$SEC_DIR/deploy/$b" ] || cp -f "$f" "$SEC_DIR/deploy/$b" 2>/dev/null ;;
                 *)    cp -f "$f" "$SEC_DIR/deploy/$b" 2>/dev/null ;;
             esac
+        done
+        # v1.3.10：同步 deploy/<内核版本>/ 子目录（按 vermagic 分发的预编译物）
+        for sd in "$d"/*/; do
+            [ -d "$sd" ] || continue
+            sb=$(basename "$sd")
+            mkdir -p "$SEC_DIR/deploy/$sb" 2>/dev/null
+            for f in "$sd"*; do
+                [ -f "$f" ] || continue
+                b=$(basename "$f")
+                case "$b" in
+                    *.ko) [ -f "$SEC_DIR/deploy/$sb/$b" ] || cp -f "$f" "$SEC_DIR/deploy/$sb/$b" 2>/dev/null ;;
+                    *)    cp -f "$f" "$SEC_DIR/deploy/$sb/$b" 2>/dev/null ;;
+                esac
+            done
         done
     fi
     chown -R 0:0 "$SEC_DIR" 2>/dev/null

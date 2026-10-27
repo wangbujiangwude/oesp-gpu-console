@@ -37,7 +37,7 @@ try:
 except Exception:
     fcntl = None
 
-VERSION = "1.3.9"
+VERSION = "1.3.10"
 APP_NAME = "gpuconsole"
 
 APP_DEST = os.environ.get("TRIM_APPDEST", "/var/apps/gpuconsole/target")
@@ -100,21 +100,109 @@ def sh(cmd, timeout=5):
         return ""
 
 
-def irq_count(name):
-    """读中断累计计数。⛔ 只读 /proc/interrupts，安全"""
-    for line in read_file("/proc/interrupts").splitlines():
+def _irq_lines():
+    """解析 /proc/interrupts -> [(中断名, 累计计数)]，只保留有编号的中断行。
+
+    ⚠ v1.3.10 修正：行格式是
+        29:  0  0  0  0  0  0   GICv2  75  Edge   vdec-0
+       └irq┘└── 每 CPU 计数 ──┘└芯片┘└hwirq┘└触发┘└名字┘
+       旧代码对 parts[1:-1] 全量 int()，会把 GIC 的**硬件中断号(hwirq)**也加进去，
+       于是"一次都没触发"的中断会显示成 75（=hwirq）而不是 0 —— panel 上"vdec 中断累计 0"
+       从来没出现过 0 就是这个原因。现在按表头的 CPU 列数取前面 N 列，遇非数字即停。"""
+    lines = read_file("/proc/interrupts").splitlines()
+    ncpu = 0
+    if lines:
+        hdr = lines[0].split()
+        if hdr and hdr[0].upper().startswith("CPU"):
+            ncpu = len(hdr)
+    out = []
+    for line in lines:
         parts = line.split()
-        if len(parts) < 2:
+        if len(parts) < 2 or not parts[0].rstrip(":").isdigit():
             continue
-        if parts[-1] == name and parts[0].rstrip(":").isdigit():
-            s = 0
-            for c in parts[1:-1]:
-                try:
-                    s += int(c)
-                except ValueError:
-                    pass
-            return s
+        nums = parts[1:1 + ncpu] if ncpu else parts[1:]
+        s = 0
+        for c in nums:
+            try:
+                s += int(c)
+            except ValueError:
+                break          # 撞上 GICv2 / hwirq / Edge 这类字段就停
+        out.append((parts[-1], s))
+    return out
+
+
+def irq_count(name):
+    """读中断累计计数（精确匹配中断名）。⛔ 只读 /proc/interrupts，安全"""
+    for iname, cnt in _irq_lines():
+        if iname == name:
+            return cnt
     return 0
+
+
+# ---------------------------------------------------------------------------
+# v1.3.10：中断名不再硬编码。
+# 中断名由"驱动路线"决定 —— 开源 panfrost 注册 panfrost-job/mmu/gpu，厂商 mali_kbase
+# 与社区 meson-vdec 则注册成 ffe40000.gpu / vdec-0 / vdec-1。旧版只认 panfrost-*，
+# 在厂商路线的机器上会一律返回 0，看起来像"GPU 完全空闲"，实际是"没采集到"。
+# 现在按候选名探测，并且把「采集到但为 0」与「根本没这个中断」区分开（后者给 names=[]）。
+GPU_IRQ_JOB = ("panfrost-job", "panfrost-gpu")         # panfrost 路线：可区分 job
+GPU_IRQ_FALLBACK = ("ffe40000.gpu", "mali", "gpu")     # 厂商路线：一组同名中断，只能合计
+VDEC_IRQ = ("vdec", "amvdec", "meson-vdec")            # 前缀匹配：vdec / vdec-0 / vdec-1 都算
+
+
+def irq_sum_any(names, prefix=False):
+    """求和命中任一候选中断名的计数，返回 (总数, 命中名列表)。
+    一条都没命中 => (0, []) —— 与"命中了但计数为 0"可区分。
+    prefix=True 时按前缀匹配（用于 vdec-0/vdec-1 这类带序号的）。"""
+    total, hit = 0, []
+    for name, cnt in _irq_lines():
+        for cand in names:
+            if name.startswith(cand) if prefix else name == cand:
+                total += cnt
+                if name not in hit:
+                    hit.append(name)
+                break
+    return total, hit
+
+
+def gpu_irq():
+    """GPU 中断：优先 panfrost-job（可区分任务类型），退化到厂商路线同名中断合计"""
+    for cand in GPU_IRQ_JOB:          # 逐个试，命中即止（不要把 job 和 gpu 混着加）
+        total, hit = irq_sum_any((cand,))
+        if hit:
+            return total, hit, False
+    total, hit = irq_sum_any(GPU_IRQ_FALLBACK, prefix=True)
+    return total, hit, bool(hit)     # merged=True 表示"只知道是 GPU，区分不出 job/mmu/gpu"
+
+
+def v4l2_devices():
+    """扫描 V4L2 节点并按**设备名**归类（不再硬编码 video0）。
+    ⛔ 只读 /sys/class/video4linux/*/name（白名单路径），绝不 open 任何 /dev/video*，
+       尤其不会碰雷区 /dev/video26。返回：
+       usable  = 可安全使用的社区硬解节点（meson-video-decoder 等）
+       vendor  = 厂商栈节点（aml-vcodec-dec，通常落在 video26）"""
+    out = {"nodes": [], "usable": "", "usable_name": "", "vendor": "", "vendor_name": ""}
+    try:
+        entries = sorted(os.listdir("/sys/class/video4linux"))
+    except OSError:
+        return out
+    for e in entries:
+        n = read_file("/sys/class/video4linux/%s/name" % e, "").strip()
+        if not n:
+            continue
+        low = n.lower()
+        if "meson" in low and "dec" in low:
+            cls = "ok"
+        elif "aml-vcodec" in low or "amvdec" in low:
+            cls = "vendor"
+        else:
+            cls = "other"
+        out["nodes"].append({"node": e, "name": n, "class": cls})
+        if cls == "ok" and not out["usable"]:
+            out["usable"], out["usable_name"] = e, n
+        elif cls == "vendor" and not out["vendor"]:
+            out["vendor"], out["vendor_name"] = e, n
+    return out
 
 
 # --------------------------------------------------------------------------- 采集
@@ -127,6 +215,13 @@ def meminfo():
 
 
 def gpu_freq():
+    # v1.3.10：厂商 mali_kbase 路线的内核不导出 GPU devfreq 节点，
+    # 旧版一律返回 0 MHz 且四个档位按钮点了没反应（用户会当成故障）。
+    # 现在显式给出 available=false，前端据此显示"不可读"并禁用按钮。
+    if not os.path.isdir(GPU_DEVFREQ):
+        return {"available": False, "cur_mhz": 0, "min_mhz": 0, "max_mhz": 0,
+                "governor": "-", "freq_percent": 0.0,
+                "reason": "本机内核未导出 %s（厂商私有调频），频率读数与档位不可用" % GPU_DEVFREQ}
     cur = read_file(GPU_DEVFREQ + "/cur_freq", "0")
     try:
         cur = int(cur)
@@ -141,6 +236,7 @@ def gpu_freq():
     except ValueError:
         mx = 0
     return {
+        "available": True, "reason": "",
         "cur_mhz": round(cur / 1e6, 1),
         "min_mhz": round(mn / 1e6, 1),
         "max_mhz": round(mx / 1e6, 1),
@@ -180,6 +276,10 @@ def modules():
         "panfrost": has("panfrost") or os.path.isdir("/sys/bus/platform/drivers/panfrost"),
         "meson_vdec": has("meson_vdec"),
         "mali_kbase": has("mali_kbase"),
+        # v1.3.10：厂商闭源路线走 /dev/mali0 字符设备，没有 DRM 层，
+        # 旧版只看 panfrost 就把这条路判成"GPU 全废"。
+        "mali_dev": os.path.exists("/dev/mali0"),
+        "dri": os.path.isdir("/dev/dri"),
     }
 
 
@@ -193,6 +293,7 @@ def devices():
     ):
         r[name] = os.path.exists(path)
     r["video0_name"] = read_file("/sys/class/video4linux/video0/name", "-") if r["vdec_video0"] else "-"
+    r["v4l2"] = v4l2_devices()
     return r
 
 
@@ -833,11 +934,18 @@ def do_repair(level):
 def collect():
     """采集一帧快照"""
     now = time.time()
+    # v1.3.10：按候选中断名探测（panfrost-* → ffe40000.gpu / vdec-0、vdec-1）
+    g_total, g_names, g_merged = gpu_irq()
+    v_total, v_names = irq_sum_any(VDEC_IRQ, prefix=True)
     irq = {
-        "panfrost-job": irq_count("panfrost-job"),
+        "panfrost-job": g_total,          # 保留旧 key，避免前端 undefined
         "panfrost-mmu": irq_count("panfrost-mmu"),
         "panfrost-gpu": irq_count("panfrost-gpu"),
-        "vdec": irq_count("vdec"),
+        "vdec": v_total,
+    }
+    irq_meta = {
+        "gpu": {"total": g_total, "names": g_names, "merged": g_merged},
+        "vdec": {"total": v_total, "names": v_names},
     }
     mi = meminfo()
 
@@ -845,9 +953,15 @@ def collect():
     rate = {"job": 0.0, "vdec": 0.0}
     if _last_irq and now > _last_ts:
         dt = now - _last_ts
-        rate["job"] = round((irq["panfrost-job"] - _last_irq.get("panfrost-job", irq["panfrost-job"])) / dt, 2)
-        rate["vdec"] = round((irq["vdec"] - _last_irq.get("vdec", irq["vdec"])) / dt, 2)
-    _last_irq = irq
+        prev = _last_irq.get("meta") or {}
+        pg = prev.get("gpu") or {}
+        pv = prev.get("vdec") or {}
+        # 中断名消失/出现（换驱动路线）时不算速率，避免出现 -8000/s 这种假值
+        if pg.get("names") == g_names:
+            rate["job"] = round((g_total - pg.get("total", g_total)) / dt, 2)
+        if pv.get("names") == v_names:
+            rate["vdec"] = round((v_total - pv.get("total", v_total)) / dt, 2)
+    _last_irq = {"meta": irq_meta}
     _last_ts = now
 
     try:
@@ -855,12 +969,14 @@ def collect():
         cma_total = int(mi.get("CmaTotal", "0")) // 1024
     except ValueError:
         cma_free = cma_total = 0
+    cma_pct = round((cma_total - cma_free) * 100.0 / cma_total, 1) if cma_total else 0.0
 
     ctrs = containers()
     snap = {
         "ts": now,
         "time": time.strftime("%H:%M:%S"),
         "irq": irq,
+        "irq_meta": irq_meta,
         "rate": rate,
         "gpu": gpu_freq(),
         "thermal": thermal(),
@@ -868,8 +984,9 @@ def collect():
         "devices": devices(),
         "containers": ctrs or [],
         "docker_error": (ctrs is None),
-        "cma": {"free_mb": cma_free, "total_mb": cma_total,
-                "used_percent": round((cma_total - cma_free) * 100.0 / cma_total, 1) if cma_total else 0},
+        # v1.3.10：CMA 绿色满条会被读成"健康"，实际上快耗尽是要紧信号 —— 按占用率分级
+        "cma": {"free_mb": cma_free, "total_mb": cma_total, "used_percent": cma_pct,
+                "level": ("bad" if cma_pct >= 95 else ("warn" if cma_pct >= 80 else "ok"))},
         "loadavg": read_file("/proc/loadavg", "-").split()[0:3],
         "uptime_s": int(float(read_file("/proc/uptime", "0").split()[0] or 0)),
         "sched_timeout": int(sh("dmesg 2>/dev/null | grep -c 'gpu sched timeout'") or 0),
@@ -1803,35 +1920,107 @@ async function load(){
 
 function render(d){
   window.__last = d;                           // 折叠面板展开时可立即补渲染
-  $('sub').textContent = '内核 ' + (d.devices.video0_name !== '-' ? 'VDEC 就绪' : 'VDEC 未就绪')
+  // v1.3.10：顶部结论按**设备名**判定，不再只看 /dev/video0
+  const v4 = d.devices.v4l2 || {};
+  const vdecWord = v4.usable ? ('VDEC 就绪 · ' + v4.usable)
+                 : v4.vendor ? ('厂商解码栈已加载 · ' + v4.vendor + ' 未启用')
+                 : 'VDEC 未就绪';
+  $('sub').textContent = '内核 ' + vdecWord
     + ' · 运行 ' + Math.floor(d.uptime_s/3600) + ' 小时 · 更新 ' + d.time;
 
+  const im = d.irq_meta || {};
+  const gm = im.gpu || {}, vm = im.vdec || {};
+  const jobOk = (gm.names || []).length > 0, vdecOk = (vm.names || []).length > 0;
   const job = d.rate.job, vdec = d.rate.vdec;
-  $('jobrate').innerHTML = job.toFixed(2) + '<span class="unit">/s</span>';
-  maxJob = Math.max(maxJob, job);
-  $('jobbar').style.width = Math.min(100, job / maxJob * 100) + '%';
 
-  $('vdecrate').innerHTML = vdec.toFixed(2) + '<span class="unit">/s</span>';
-  maxVdec = Math.max(maxVdec, vdec);
-  $('vdecbar').style.width = Math.min(100, vdec / maxVdec * 100) + '%';
+  // 「采集到但为 0」与「本机没这个中断」必须能区分：后者显示原因，不显示 0.00/s
+  if (jobOk){
+    $('jobrate').innerHTML = job.toFixed(2) + '<span class="unit">/s</span>';
+    maxJob = Math.max(maxJob, job);
+    $('jobbar').style.width = Math.min(100, job / maxJob * 100) + '%';
+  } else {
+    $('jobrate').innerHTML = '<span style="font-size:16px">无此中断</span>';
+    $('jobbar').style.width = '0%';
+  }
+  if (vdecOk){
+    $('vdecrate').innerHTML = vdec.toFixed(2) + '<span class="unit">/s</span>';
+    maxVdec = Math.max(maxVdec, vdec);
+    $('vdecbar').style.width = Math.min(100, vdec / maxVdec * 100) + '%';
+  } else {
+    $('vdecrate').innerHTML = '<span style="font-size:16px">无此中断</span>';
+    $('vdecbar').style.width = '0%';
+  }
 
-  $('freq').innerHTML = d.gpu.cur_mhz + '<span class="unit">MHz</span>';
-  $('freqbar').style.width = d.gpu.freq_percent + '%';
-  $('freqrange').textContent = '范围 ' + d.gpu.min_mhz + '–' + d.gpu.max_mhz + ' MHz ｜ 策略 ' + d.gpu.governor;
+  // 频率：无 devfreq 节点时明说，并禁掉四个档位按钮（旧版点了没反应，像故障）
+  const freqBtns = document.querySelectorAll('[data-freq]');
+  if (d.gpu && d.gpu.available === false){
+    $('freq').innerHTML = '<span style="font-size:18px">不可读</span>';
+    $('freqbar').style.width = '0%';
+    $('freqrange').textContent = d.gpu.reason || '本机内核未导出 devfreq 节点';
+    freqBtns.forEach(b => { b.disabled = true; b.style.opacity = '.4'; });
+  } else {
+    $('freq').innerHTML = d.gpu.cur_mhz + '<span class="unit">MHz</span>';
+    $('freqbar').style.width = d.gpu.freq_percent + '%';
+    $('freqrange').textContent = '范围 ' + d.gpu.min_mhz + '–' + d.gpu.max_mhz + ' MHz ｜ 策略 ' + d.gpu.governor;
+    freqBtns.forEach(b => { b.disabled = false; b.style.opacity = ''; });
+  }
 
   $('cma').innerHTML = d.cma.free_mb + '<span class="unit">MB 空闲</span>';
   $('cmabar').style.width = d.cma.used_percent + '%';
-  $('cmarange').textContent = '总量 ' + d.cma.total_mb + ' MB ｜ 已用 ' + d.cma.used_percent + '%';
+  const lvl = d.cma.level || 'ok';
+  $('cmabar').style.background = lvl === 'bad' ? 'var(--red)' : (lvl === 'warn' ? 'var(--yellow)' : 'var(--green)');
+  $('cmarange').textContent = '总量 ' + d.cma.total_mb + ' MB ｜ 已用 ' + d.cma.used_percent + '%'
+    + (lvl === 'bad' ? '　⚠ 连续内存已耗尽，新增大块 DMA / 硬解缓冲会失败' : '');
+
+  // v1.3.10：区分「开源 panfrost 路线」与「厂商 mali_kbase 路线」。
+  // 只有两者**同时**存在才算冲突；只加载 mali_kbase 时它是本机唯一生效的 3D 驱动，
+  // 旧版把它标成"冲突"会误导用户去禁用它 —— 那是高风险操作。
+  const M = d.modules || {};
+  let row3d, rowMali;
+  if (M.panfrost && M.mali_kbase){
+    row3d  = '已就位<span class="tag t-warn">与 mali_kbase 并存</span>';
+    rowMali = '已加载<span class="tag t-warn">冲突</span>';
+  } else if (M.panfrost){
+    row3d  = '已就位（开源路线）<span class="tag t-ok">OK</span>';
+    rowMali = '未加载<span class="tag t-ok">OK</span>';
+  } else if (M.mali_kbase){
+    row3d  = '未加载<span class="tag t-warn">本机走厂商路线</span>';
+    rowMali = (M.mali_dev ? '已加载 · /dev/mali0 在（厂商路线）' : '已加载，但无 /dev/mali0')
+            + '<span class="tag t-ok">唯一生效路线</span>';
+  } else {
+    row3d  = '未加载<span class="tag t-bad">FAIL</span>';
+    rowMali = '未加载<span class="tag t-bad">FAIL</span>';
+  }
+
+  // 硬解节点按**设备名**探测，不再硬编码 video0
+  let rowVdec;
+  if (v4.usable){
+    rowVdec = '/dev/' + v4.usable + ' · ' + (v4.usable_name || '?') + '<span class="tag t-ok">可用</span>';
+  } else if (v4.vendor){
+    rowVdec = '/dev/' + v4.vendor + ' · ' + (v4.vendor_name || '?')
+            + '<span class="tag t-warn">厂商栈·未启用</span>';
+  } else {
+    rowVdec = '未找到硬解节点<span class="tag t-bad">FAIL</span>';
+  }
+
+  const jobIrqTxt = jobOk
+    ? (gm.total + '<span class="unit">' + (gm.names || []).join('+') + (gm.merged ? ' 同类合并' : '') + '</span>')
+    : '本机无 GPU 中断<span class="tag t-warn">路线不匹配</span>';
+  const vdecIrqTxt = vdecOk
+    ? (vm.total + '<span class="unit">' + (vm.names || []).join('+') + '</span>')
+    : '本机无硬解中断<span class="tag t-warn">路线不匹配</span>';
 
   const rows = [
-    ['3D 驱动 panfrost', d.modules.panfrost ? '已就位<span class="tag t-ok">OK</span>' : '未加载<span class="tag t-bad">FAIL</span>'],
-    ['硬解模块 meson-vdec', d.modules.meson_vdec ? '已加载<span class="tag t-ok">OK</span>' : '未加载<span class="tag t-warn">需 modprobe</span>'],
-    ['闭源 mali_kbase', d.modules.mali_kbase ? '已加载<span class="tag t-warn">冲突</span>' : '已屏蔽<span class="tag t-ok">OK</span>'],
-    ['/dev/video0 (VDEC)', d.devices.vdec_video0 ? d.devices.video0_name + '<span class="tag t-ok">OK</span>' : '不存在<span class="tag t-bad">FAIL</span>'],
-    ['/dev/dri/renderD128', d.devices.dri_renderD128 ? '存在<span class="tag t-ok">OK</span>' : '不存在<span class="tag t-bad">FAIL</span>'],
+    ['3D 驱动 panfrost', row3d],
+    ['硬解模块 meson-vdec', M.meson_vdec ? '已加载<span class="tag t-ok">OK</span>' : '未加载<span class="tag t-warn">需 modprobe</span>'],
+    ['闭源 mali_kbase', rowMali],
+    ['硬解节点（按名探测）', rowVdec],
+    ['/dev/dri/renderD128', d.devices.dri_renderD128
+        ? '存在<span class="tag t-ok">OK</span>'
+        : '不存在<span class="tag t-warn">无 DRM 层·GPU 归因不可用</span>'],
     ['gpu sched timeout 累计', d.sched_timeout === 0 ? '0<span class="tag t-ok">OK</span>' : d.sched_timeout + '<span class="tag t-bad">异常</span>'],
-    ['job 中断累计', d.irq['panfrost-job']],
-    ['vdec 中断累计', d.irq.vdec]
+    ['GPU 中断累计', jobIrqTxt],
+    ['硬解中断累计', vdecIrqTxt]
   ];
   $('tbl').innerHTML = rows.map(r => '<tr><td>' + r[0] + '</td><td>' + r[1] + '</td></tr>').join('')
     + d.thermal.map(t => '<tr><td>温度 ' + t.type + '</td><td>' + t.celsius + ' °C</td></tr>').join('');
@@ -1866,7 +2055,10 @@ function render(d){
     $('warnbox').innerHTML = '⚠️ 特权容器 <b>' + risky.join('、') + '</b> 能看到雷区设备 '
       + '<code>/dev/video26</code> 与 <code>/sys/class/vdec/*</code>。'
       + '在容器内访问它们会<b>整机内核级死锁，必须物理断电</b>。'
-      + '普通应用建议改用最小权限：<code>--device=/dev/video0 --group-add 44 --group-add 105</code>';
+      // v1.3.10：最小权限建议里的设备名改成实际探测到的那个（厂商路线的机器上没有 video0）
+      + '普通应用建议改用最小权限：<code>--device=/dev/'
+      + (((window.__last && window.__last.devices.v4l2 && window.__last.devices.v4l2.usable) || 'video0'))
+      + ' --group-add 44 --group-add 105</code>';
   } else {
     $('warnbox').style.display = 'none';
   }
